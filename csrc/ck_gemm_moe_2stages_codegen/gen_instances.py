@@ -367,8 +367,8 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim)
 
 heuristic_dispatch_dict = {
     "a8w8_gfx950": [
-        A16W16_A8W8_gemm1_gfx950_heuristic_dispatch,
-        A16W16_A8W8_gemm2_gfx950_heuristic_dispatch,
+        A16W16_A8W8_gemm1_heuristic_dispatch,
+        A16W16_A8W8_gemm2_heuristic_dispatch,
     ],
     "a8w8": [
         A16W16_A8W8_gemm1_heuristic_dispatch,
@@ -379,8 +379,8 @@ heuristic_dispatch_dict = {
         A8W8_blockscale_gemm2_heuristic_dispatch,
     ],
     "a16w16_gfx950": [
-        A16W16_A8W8_gemm1_gfx950_heuristic_dispatch,
-        A16W16_A8W8_gemm2_gfx950_heuristic_dispatch,
+        A16W16_A8W8_gemm1_heuristic_dispatch,
+        A16W16_A8W8_gemm2_heuristic_dispatch,
     ],
     "a16w16": [
         A16W16_A8W8_gemm1_heuristic_dispatch,

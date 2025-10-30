@@ -176,9 +176,9 @@ a4w4_gemm1_kernels_list= {
 }
 
 gemm1_kernels_dict = {
-    "a16w16_gfx950": a16w16_gemm1_kernels_list_gfx950,
+    "a16w16_gfx950": a16w16_gemm1_kernels_list,
     "a16w16": a16w16_gemm1_kernels_list,
-    "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
+    "a8w8_gfx950": a8w8_gemm1_kernels_list,
     "a8w8": a8w8_gemm1_kernels_list,
     "a8w8blkscale": a8w8_gemm1_blockscale_kernels_list,
     "a8w4": a8w4_gemm1_kernels_list,
@@ -265,9 +265,9 @@ a4w4_gemm2_kernels_list= {
 
 # fmt: on
 gemm2_kernels_dict = {
-    "a16w16_gfx950": a16w16_gemm2_kernels_list_gfx950,
+    "a16w16_gfx950": a16w16_gemm2_kernels_list,
     "a16w16": a16w16_gemm2_kernels_list,
-    "a8w8_gfx950": a8w8_gemm2_kernels_list_gfx950,
+    "a8w8_gfx950": a8w8_gemm2_kernels_list,
     "a8w8": a8w8_gemm2_kernels_list,
     "a8w8blkscale": a8w8_gemm2_blockscale_kernels_list,
     "a8w4": a8w4_gemm2_kernels_list,
