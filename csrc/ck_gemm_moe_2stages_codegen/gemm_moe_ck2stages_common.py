@@ -115,7 +115,7 @@ a16w16_gemm1_kernels_list= {
      4: kernelInstanceGEMM1(       256,       128,        64,        64,     1,       4,        1,),
 
      5: kernelInstanceGEMM1(       256,        64,       128,       128,     1,       4,        3,),
-    #  6: kernelInstanceGEMM1(       256,        64,       128,        64,     1,       4,        3,),
+     6: kernelInstanceGEMM1(       256,        64,       128,        64,     1,       4,        3,),
      7: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
      8: kernelInstanceGEMM1(       256,       128,       128,        64,     1,       4,        3,),
      9: kernelInstanceGEMM1(      256,       256,       128,        64,     1,       4,        3,),

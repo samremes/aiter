@@ -1,0 +1,10 @@
+stage,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us,kernelName,err
+stage1,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,0,237.8606,moe_ck2stages_gemm1_256x32x64x128_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,0,239.2524,moe_ck2stages_gemm1_256x32x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage2,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,0,116.9025,moe_ck2stages_gemm2_256x32x64x64_1x4_TypeCastExpertWeight_v1_Nswizzle0_no_MulRoutedWeight1,0.1%
+stage1,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,0,161.9352,moe_ck2stages_gemm1_256x64x64x128_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,0,164.4497,moe_ck2stages_gemm1_256x64x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage2,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,0,138.7495,moe_ck2stages_gemm2_256x64x128x64_1x4_TypeCastExpertWeight_v3_Nswizzle0_no_MulRoutedWeight1,0.1%
+stage1,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,175.7597,moe_ck2stages_gemm1_256x128x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage2,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,154.5102,moe_ck2stages_gemm2_256x128x64x64_1x4_TypeCastExpertWeight_v1_Nswizzle0_no_MulRoutedWeight1,0.1%
+stage2,1024,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,165.9218,moe_ck2stages_gemm2_256x128x128x64_1x4_TypeCastExpertWeight_v3_Nswizzle0_no_MulRoutedWeight1,0.1%

@@ -831,7 +831,7 @@ parser.add_argument(
     "-a",
     "--act",
     type=str,
-    choices=["silu", "gelu"],
+    choices=["silu", "gelu", "swiglu"],
     default=None,
     help="""Select activation type.
     e.g.: -a silu""",
