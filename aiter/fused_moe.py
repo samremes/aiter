@@ -629,23 +629,23 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
-        if (
-            activation,
-            q_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            use_g1u1,
-            doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
-            if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
-            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
-                run_1stage = token > 32
-            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
-                run_1stage = token > 16
-            elif q_type != QuantType.per_1x32:
-                run_1stage = token < 256
+        # if (
+        #     activation,
+        #     q_type,
+        #     dtype,
+        #     q_dtype_a,
+        #     q_dtype_w,
+        #     use_g1u1,
+        #     doweight_stage1,
+        # ) in fused_moe_1stage_dict[get_gfx()]:
+        #     if q_type == QuantType.per_1x128:
+        #         run_1stage = True and (inter_dim % 256 == 0)
+        #     elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
+        #         run_1stage = token > 32
+        #     elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
+        #         run_1stage = token > 16
+        #     elif q_type != QuantType.per_1x32:
+        #         run_1stage = token < 256
 
         block_m = (
             BLOCK_SIZE_M
@@ -739,7 +739,7 @@ def get_2stage_cfgs(
 
     return MOEMetadata(
         functools.partial(
-            asm_stage1,
+            aiter.ck_moe_stage1_fwd,
             kernelName=kernelName1,
             activation=activation,
             quant_type=q_type,
@@ -1225,7 +1225,7 @@ def torch_moe_stage2(
     elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
         a2_scale = a2_scale.view(hidden_states.shape[0], topk, -1, 1)
         a2_scale = a2_scale.repeat(1, 1, 1, 128).view(hidden_states.shape[0], topk, -1)
-        hidden_states = hidden_states * a2_scale
+        hidden_states = hidden_states * a2_scale[:, :, :hidden_states.shape[-1]]
 
         w2_shape = w2.shape
         w2 = w2.view(
