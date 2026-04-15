@@ -131,9 +131,33 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     int N = WQ.size(0);
     int K = XQ.size(1);
 
+    TORCH_CHECK(x_scale.stride(-1) == 1,
+                "CK blockscale GEMM: x_scale inner dim must be contiguous, "
+                "got strides=[",
+                x_scale.stride(0),
+                ",",
+                x_scale.stride(1),
+                "]");
+    TORCH_CHECK(w_scale.stride(-1) == 1,
+                "CK blockscale GEMM: w_scale inner dim must be contiguous, "
+                "got strides=[",
+                w_scale.stride(0),
+                ",",
+                w_scale.stride(1),
+                "]");
+
     int StrideA = XQ.stride(-2);
     int StrideB = WQ.stride(-2);
     int StrideE = N;
+    int StrideScaleA = x_scale.stride(0);
+    int StrideScaleB = w_scale.stride(0);
+
+    if(getenv("AITER_DEBUG_TENSORS")) {
+        printf("[CK-CPP] M=%d N=%d K=%d strA=%d strB=%d strE=%d "
+               "strAs=%d strBs=%d kbatch=%d\n",
+               M, N, K, StrideA, StrideB, StrideE,
+               StrideScaleA, StrideScaleB, KBatch);
+    }
 
     auto a_element_op   = AElementOp{};
     auto b_element_op   = BElementOp{};
@@ -155,6 +179,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                              StrideB,
                                              std::array<ck::index_t, NumDTensor>{},
                                              StrideE,
+                                             StrideScaleA,
+                                             StrideScaleB,
                                              reinterpret_cast<DDataType*>(x_scale.data_ptr()),
                                              reinterpret_cast<DDataType*>(w_scale.data_ptr()),
                                              a_element_op,
