@@ -2,11 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import Optional
 
 import pandas as pd
 import torch
 from aiter import logger
+from pathlib import Path
 from torch import Tensor
 from torch.library import Library
 
@@ -648,6 +650,104 @@ def gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _maybe_compare_blockscale_ck_vs_cktile(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype,
+    selected_libtype: str,
+    splitK: int,
+    used_default: bool,
+) -> None:
+    if not os.environ.get("AITER_COMPARE_BLOCKSCALE_CK_CKTILE"):
+        return
+
+    y_ck = torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+    y_cktile = torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+    gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, y_ck, splitK=splitK)
+    gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, y_cktile, splitK=splitK)
+
+    diff = (y_ck.float() - y_cktile.float()).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    allclose = torch.allclose(y_ck, y_cktile, rtol=1e-2, atol=1e-2)
+    mismatch = int((~torch.isclose(y_ck, y_cktile, rtol=1e-2, atol=1e-2)).sum().item())
+    total = y_ck.numel()
+
+    print(
+        "[BLOCKSCALE-COMPARE] "
+        f"m={XQ.shape[0]} n={WQ.shape[0]} k={XQ.shape[1]} "
+        f"selected={selected_libtype} splitK={splitK} used_default={int(used_default)} "
+        f"allclose={int(allclose)} mismatch={mismatch}/{total} "
+        f"max_abs={max_abs:.6e} mean_abs={mean_abs:.6e}",
+        flush=True,
+    )
+
+    if allclose:
+        return
+
+    dump_dir = os.environ.get("AITER_COMPARE_BLOCKSCALE_DUMP_DIR")
+    if dump_dir:
+        dump_root = Path(dump_dir)
+        dump_root.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_root / (
+            f"blockscale_compare_m{XQ.shape[0]}_n{WQ.shape[0]}_k{XQ.shape[1]}_"
+            f"{selected_libtype}_default{int(used_default)}.pt"
+        )
+        if not dump_path.exists():
+            ref = None
+            try:
+                block_n = 128
+                block_k = 128
+                m = XQ.shape[0]
+                k = XQ.shape[1]
+                n = WQ.shape[0]
+                scale_k = (k + block_k - 1) // block_k
+                scale_n = (n + block_n - 1) // block_n
+                x_f = XQ.to(torch.float32).view(m, scale_k, block_k) * x_scale.unsqueeze(-1)
+                x_f = x_f.view(m, k)
+                w_s = w_scale.view(scale_n, 1, scale_k, 1).expand(
+                    scale_n, block_n, scale_k, block_k
+                )
+                w_s = w_s.reshape(scale_n * block_n, scale_k * block_k)[:n, :k]
+                w_f = WQ.to(torch.float32) * w_s
+                ref = torch.nn.functional.linear(x_f, w_f).to(dtype)
+            except Exception as exc:
+                print(f"[BLOCKSCALE-COMPARE] reference build failed: {exc!r}", flush=True)
+
+            torch.save(
+                {
+                    "XQ": XQ.detach().cpu(),
+                    "WQ": WQ.detach().cpu(),
+                    "x_scale": x_scale.detach().cpu(),
+                    "w_scale": w_scale.detach().cpu(),
+                    "y_ck": y_ck.detach().cpu(),
+                    "y_cktile": y_cktile.detach().cpu(),
+                    "y_ref": ref.detach().cpu() if ref is not None else None,
+                    "meta": {
+                        "selected_libtype": selected_libtype,
+                        "splitK": splitK,
+                        "used_default": used_default,
+                        "allclose": allclose,
+                        "mismatch": mismatch,
+                        "total": total,
+                        "max_abs": max_abs,
+                        "mean_abs": mean_abs,
+                        "dtype": str(dtype),
+                    },
+                },
+                dump_path,
+            )
+            print(f"[BLOCKSCALE-COMPARE-DUMP] path={dump_path}", flush=True)
+
+    if os.environ.get("AITER_COMPARE_BLOCKSCALE_EXIT_ON_MISMATCH"):
+        raise RuntimeError(
+            "AITER_COMPARE_BLOCKSCALE_EXIT_ON_MISMATCH triggered after first CK/CKTile mismatch"
+        )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
@@ -674,9 +774,19 @@ def gemm_a8w8_blockscale(
         config = get_CKGEMM_config(
             m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
         )
+        if os.environ.get("AITER_DEBUG_TENSORS"):
+            print(f"[GEMM-DISPATCH] m={m} n={n} k={k} "
+                  f"config={config} "
+                  f"XQ.stride={XQ.stride()} WQ.stride={WQ.stride()} "
+                  f"xs.stride={x_scale.stride()} ws.stride={w_scale.stride()} "
+                  f"Y.stride={Y.stride()} Y.ptr=0x{Y.data_ptr():x}",
+                  flush=True)
         if config is not None:
             libtype = config["libtype"]
             splitK = int(config.get("splitK", 0))
+            _maybe_compare_blockscale_ck_vs_cktile(
+                XQ, WQ, x_scale, w_scale, dtype, libtype, splitK, used_default=False
+            )
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
                     XQ, WQ, x_scale, w_scale, Y, splitK=splitK
@@ -687,7 +797,10 @@ def gemm_a8w8_blockscale(
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        _maybe_compare_blockscale_ck_vs_cktile(
+            XQ, WQ, x_scale, w_scale, dtype, "cktile", 0, used_default=True
+        )
+        return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
 
 
 def flatmm_a8w8_blockscale_ASM(

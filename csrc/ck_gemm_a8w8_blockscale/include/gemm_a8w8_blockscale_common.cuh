@@ -154,9 +154,16 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
 
     if(getenv("AITER_DEBUG_TENSORS")) {
         printf("[CK-CPP] M=%d N=%d K=%d strA=%d strB=%d strE=%d "
-               "strAs=%d strBs=%d kbatch=%d\n",
+               "strAs=%d strBs=%d kbatch=%d "
+               "stream=%p A=%p As=%p B=%p Bs=%p E=%p\n",
                M, N, K, StrideA, StrideB, StrideE,
-               StrideScaleA, StrideScaleB, KBatch);
+               StrideScaleA, StrideScaleB, KBatch,
+               at::hip::getCurrentHIPStream(),
+               XQ.data_ptr(),
+               x_scale.data_ptr(),
+               WQ.data_ptr(),
+               w_scale.data_ptr(),
+               Y.data_ptr());
     }
 
     auto a_element_op   = AElementOp{};

@@ -305,6 +305,20 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
                 ",",
                 Y.stride(1),
                 "]");
+    TORCH_CHECK(x_scale.stride(-1) == 1,
+                "CKTile blockscale GEMM: x_scale inner dim must be contiguous, "
+                "got strides=[",
+                x_scale.stride(0),
+                ",",
+                x_scale.stride(1),
+                "]");
+    TORCH_CHECK(w_scale.stride(-1) == 1,
+                "CKTile blockscale GEMM: w_scale inner dim must be contiguous, "
+                "got strides=[",
+                w_scale.stride(0),
+                ",",
+                w_scale.stride(1),
+                "]");
 
     // M, N, K
     const int M = XQ.size(0);
@@ -331,6 +345,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     // Declared at function scope so the transposed tensor stays alive
     // through the async kernel launch.
     torch::Tensor x_scale_t;
+    bool uses_temp_aq = false;
 
     if constexpr(aq_col_major)
     {
@@ -339,6 +354,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
         {
             x_scale_t   = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
             args.aq_ptr = x_scale_t.data_ptr();
+            uses_temp_aq = true;
         }
         else
         {
@@ -351,6 +367,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
         {
             x_scale_t   = x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
             args.aq_ptr = x_scale_t.data_ptr();
+            uses_temp_aq = true;
         }
         else
         {
@@ -385,6 +402,32 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_C  = Y.stride(0);
     const int stride_AQ = aq_col_major ? M : static_cast<int>(x_scale.stride(0));
     const int stride_BQ = w_scale.stride(0);
+
+    if(getenv("AITER_DEBUG_TENSORS")) {
+        const hipStream_t stream = static_cast<hipStream_t>(at::hip::getCurrentHIPStream());
+        const void* temp_aq_ptr = uses_temp_aq ? x_scale_t.data_ptr() : nullptr;
+        printf("[CKTILE-CPP] M=%d N=%d K=%d strA=%d strB=%d strC=%d "
+               "strAQ=%d strBQ=%d kbatch=%d aq_col=%d 8w=%d "
+               "stream=%p uses_temp_aq=%d "
+               "args{A=%p AQ=%p B=%p BQ=%p C=%p} "
+               "raw{X=%p XS=%p XStmp=%p W=%p WS=%p Y=%p}\n",
+               M, N, K, stride_A, stride_B, stride_C,
+               stride_AQ, stride_BQ, k_batch,
+               static_cast<int>(aq_col_major), static_cast<int>(eight_waves),
+               static_cast<void*>(stream),
+               static_cast<int>(uses_temp_aq),
+               args.a_ptr,
+               args.aq_ptr,
+               args.b_ptr,
+               args.bq_ptr,
+               args.c_ptr,
+               XQ.data_ptr(),
+               x_scale.data_ptr(),
+               temp_aq_ptr,
+               WQ.data_ptr(),
+               w_scale.data_ptr(),
+               Y.data_ptr());
+    }
 
     args.QK_A      = AQK;
     args.QK_B      = BQK;
