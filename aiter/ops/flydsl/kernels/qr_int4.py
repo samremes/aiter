@@ -3,8 +3,11 @@
 
 """Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
-Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ grid_cap``.
+Public type ``QRInt4``. Super-tile ST∈{1,8,9}; ST=1 when ``num_tiles ≤ grid_cap``.
 INT4 nibble + group-16 E4M3. Payload HBM is bf16.
+
+``enable_pack_pipeline`` and ``cta_batch`` are compile-time gates (default
+off). Pack overlap is ST≥2 only; paired CTA handshake is ST=1 only.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
     DEFAULT_GRID_CAP,
+    DEFAULT_SUPER_TILE,
+    GRID_AWARE_SUPER_TILE,
     SUPER_TILES,
     SUPPORTED_WORLDS,
     TILE_BYTES,
@@ -30,6 +35,31 @@ from .qr_int4_kernel import (
 )
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+def select_super_tile(
+    num_tiles: int,
+    *,
+    grid: int,
+    fallback_st: int,
+    arch: str,
+    world_size: int,
+    enable_st9: bool = False,
+) -> int:
+    """Pick compile-time super-tile for one launch from tile count and grid."""
+    grid_x = min(num_tiles, grid)
+    if fallback_st == 1 or num_tiles <= grid:
+        return 1
+    max_block_tiles = (num_tiles + grid_x - 1) // grid_x
+    if (
+        enable_st9
+        and arch == "gfx950"
+        and world_size == 8
+        and fallback_st == DEFAULT_SUPER_TILE
+        and max_block_tiles == GRID_AWARE_SUPER_TILE
+    ):
+        return GRID_AWARE_SUPER_TILE
+    return fallback_st
 
 
 def _cuda_index(device) -> int:
@@ -147,6 +177,8 @@ class QRInt4:
         world_size: int = WORLD,
         super_tile: int = 8,
         grid_cap: int | None = None,
+        enable_pack_pipeline: bool = False,
+        cta_batch: int = 1,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -156,6 +188,8 @@ class QRInt4:
             raise ValueError(
                 f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
+        if int(cta_batch) not in (1, 2):
+            raise ValueError(f"cta_batch must be 1 or 2, got {cta_batch}")
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
         if group_world != int(world_size):
@@ -174,6 +208,7 @@ class QRInt4:
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
         torch.cuda.set_device(device)
+        self._arch = arch
         self.group = group
         self.device = device
         self._device_index = _cuda_index(device)
@@ -181,6 +216,8 @@ class QRInt4:
         self.world_size = int(world_size)
         self.super_tile = int(super_tile)
         self._grid = cap
+        self._enable_pack_pipeline = bool(enable_pack_pipeline)
+        self._cta_batch = int(cta_batch)
 
         sts = [1]
         if self.super_tile != 1:
@@ -191,6 +228,8 @@ class QRInt4:
                 world_size=self.world_size,
                 super_tile=st,
                 grid=self._grid,
+                enable_pack_pipeline=self._enable_pack_pipeline,
+                cta_batch=self._cta_batch,
             )
             self._by_st[st] = _StEngine(
                 spec=spec,
@@ -208,9 +247,13 @@ class QRInt4:
         self.wire_tile_bytes = primary.wire_tile_bytes
 
     def _pick_st(self, num_tiles: int) -> int:
-        if self.super_tile == 1 or num_tiles > self._grid:
-            return self.super_tile
-        return 1
+        return select_super_tile(
+            num_tiles,
+            grid=self._grid,
+            fallback_st=self.super_tile,
+            arch=self._arch,
+            world_size=self.world_size,
+        )
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):

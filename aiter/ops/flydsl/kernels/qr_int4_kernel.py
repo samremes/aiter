@@ -4,10 +4,13 @@
 """gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
+group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8,9}; host
 uses ST=1 when ``num_tiles ≤ GRID``. Payload HBM is bf16; in-kernel
 math is packed fp16. Each rank owns ``ATOMS / world_size`` atoms of a
-tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * 1152``.
+tile (8 GPUs → 1, 4 → 2, 2 → 4); pack LDS stays ``ATOMS * 1152`` plus
+one readiness word per possible peer. Optional 2-bank pack LDS
+(``enable_pack_pipeline``) overlaps pack of sub-tile s+1 with NT of s.
+Optional ``cta_batch=2`` pairs ST=1 CTAs onto one remote epoch.
 """
 
 import flydsl.compiler as flyc
@@ -32,7 +35,10 @@ PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
 RANK_TILE_BYTES = 1152
 RANK_TILE_I32 = RANK_TILE_BYTES // 4
-SUPER_TILES = (1, 8)
+DEFAULT_SUPER_TILE = 8
+GRID_AWARE_SUPER_TILE = 9
+SUPER_TILES = (1, DEFAULT_SUPER_TILE, GRID_AWARE_SUPER_TILE)
+ENABLE_RS_READY_PIPELINE = False  # experimental; ~679 µs vs ~558 µs @ 32768 TP8
 # 1024 B INT4 (256 i32) then 128 B group-16 E4M3 (32 i32). Rank-tile 1152 B.
 SCALE_I32_OFF = 256
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
@@ -45,10 +51,14 @@ QUAD_LANES = 4
 QUADS_PER_WAVE = WAVE // QUAD_LANES
 N_SECTORS = RANK_TILE_BYTES // 64
 # dest × rank_atoms == ATOMS for every supported world size.
-PACK_I32 = ATOMS * RANK_TILE_I32
-LDS_BYTES = ATOMS * RANK_TILE_BYTES
 # Wire/inbox addresses are byte pointers; tile math is in i32 slots.
 I32_BYTES = 4
+PACK_I32 = ATOMS * RANK_TILE_I32
+PACK_I32_2BANK = PACK_I32 * 2
+LDS_BYTES = ATOMS * RANK_TILE_BYTES + WORLD * I32_BYTES
+LDS_BYTES_2BANK = PACK_I32_2BANK * I32_BYTES + WORLD * I32_BYTES
+LOCAL_ARRIVE = 0
+LOCAL_VISIBLE = 1
 
 # gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
 _CM_SC1 = 2
@@ -267,9 +277,9 @@ def _load_i32_nt(rsrc, elem_off):
     )
 
 
-def _load_i32_uncached(rsrc):
+def _load_i32_uncached(rsrc, elem_off):
     val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+        rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
     )
     rocdl.s_waitcnt(vmcnt=0)
     return fx.Int32(val)
@@ -282,9 +292,24 @@ def _invalidate_l1():
 @fx.struct
 class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
+    ready: fx.Array[fx.Int32, WORLD, 4]
 
 
-def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: int):
+@fx.struct
+class PackStorage2Bank:
+    pack: fx.Array[fx.Int32, PACK_I32_2BANK, 16]
+    ready: fx.Array[fx.Int32, WORLD, 4]
+
+
+def make_qr_int4_kernel(
+    *,
+    world_size: int = WORLD,
+    super_tile: int = 1,
+    grid: int,
+    enable_rs_pipeline: bool = ENABLE_RS_READY_PIPELINE,
+    enable_pack_pipeline: bool = False,
+    cta_batch: int = 1,
+):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -295,6 +320,19 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
+    if cta_batch not in (1, 2):
+        raise ValueError(f"cta_batch must be 1 or 2, got {cta_batch}")
+    # ST=1 has n_this=1; a second pack bank is unused. Pairing is ST=1 only.
+    n_banks = 2 if (enable_pack_pipeline and super_tile != 1) else 1
+    pair_handshake = cta_batch == 2 and super_tile == 1
+    n_pairs = (grid + 1) // 2
+    PackLds = PackStorage2Bank if n_banks == 2 else PackStorage
+    pack_layout_shape = (
+        (ATOMS, RANK_TILE_I32) if n_banks == 1 else (n_banks, ATOMS, RANK_TILE_I32)
+    )
+    pack_layout_stride = (
+        (RANK_TILE_I32, 1) if n_banks == 1 else (PACK_I32, RANK_TILE_I32, 1)
+    )
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
     # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
@@ -326,7 +364,11 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        pack_layout = fx.make_layout((ATOMS, RANK_TILE_I32), (RANK_TILE_I32, 1))
+        pack_layout = fx.make_layout(pack_layout_shape, pack_layout_stride)
+        local_flag_layout = fx.make_layout(
+            (PHASES, n_pairs, 2),
+            (n_pairs * 2, 2, 1),
+        )
         # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
         # -> i32 start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
@@ -368,8 +410,9 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             ),
         )
 
-        lds = fx.SharedAllocator().allocate(PackStorage).peek()
+        lds = fx.SharedAllocator().allocate(PackLds).peek()
         pack = lds.pack.view(pack_layout)
+        ready = lds.ready.view(fx.make_layout((WORLD,), (1,)))
         smem_ptr = lds.pack.ptr
 
         peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
@@ -401,8 +444,13 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         out_buf = _payload_tensor(out_ptr)
         color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
 
-        def _pack_off(peer, i32_idx):
+        def _pack_off_flat(peer, i32_idx, bank):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
+
+        def _pack_off_banked(peer, i32_idx, bank):
+            return fx.get_scalar(fx.crd2idx((bank, peer, i32_idx), pack_layout))
+
+        _pack_off = (_pack_off_flat, _pack_off_banked)[n_banks - 1]
 
         def _sub_tile_i32(phase, src, sub):
             slot = fx.get_scalar(
@@ -443,14 +491,25 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 frag.store(packed)
                 fx.copy(hbm_copy_atom, frag, dst)
 
-        def _lds_write_packet(slot, packed, scale, is_leader):
+        def _lds_write_flat(slot, packed, scale, is_leader, bank):
             fx.memref_store(packed, pack, (slot, tid))
             if is_leader:
                 fx.memref_store(
                     scale, pack, (slot, fx.Int32(SCALE_I32_OFF) + scale_slot)
                 )
 
-        def _pack_reduce_scatter(atoms):
+        def _lds_write_banked(slot, packed, scale, is_leader, bank):
+            fx.memref_store(packed, pack, (bank, slot, tid))
+            if is_leader:
+                fx.memref_store(
+                    scale,
+                    pack,
+                    (bank, slot, fx.Int32(SCALE_I32_OFF) + scale_slot),
+                )
+
+        _lds_write_packet = (_lds_write_flat, _lds_write_banked)[n_banks - 1]
+
+        def _pack_reduce_scatter(atoms, bank):
             """Quantize each destination's slice of this tile into LDS.
 
             A 32 KiB tile is 8 atoms; destination *d* owns
@@ -463,10 +522,14 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                         atoms[dest * rank_atoms + k], lane, tid
                     )
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
+                        fx.Int32(dest * rank_atoms + k),
+                        packed,
+                        scale,
+                        is_leader,
+                        bank,
                     )
 
-        def _pack_all_gather(accs):
+        def _pack_all_gather(accs, bank):
             """Quantize the reduced slice and replicate it for every peer.
 
             After reduce-scatter this rank holds ``rank_atoms`` reduced
@@ -477,10 +540,14 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 packed, scale, is_leader = _codec_quant(accs[k], lane, tid)
                 for dest in range_constexpr(world_size):
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
+                        fx.Int32(dest * rank_atoms + k),
+                        packed,
+                        scale,
+                        is_leader,
+                        bank,
                     )
 
-        def _fanout_nt(phase, inbox_src, sub):
+        def _fanout_nt(phase, inbox_src, sub, bank):
             """NT-store one rank-tile from LDS to every peer's inbox.
 
             Three lockstep stripes cover the 18 sectors: INT4 [0, 8), INT4
@@ -509,7 +576,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                             wire_idx = vec_idx + fx.Int32(k * RANK_TILE_I32)
                         # 4xi32 NT vector cannot go through the i32 pack view.
                         v4 = fx.ptr_load(
-                            smem_ptr + _pack_off(pack_peer, vec_idx),
+                            smem_ptr + _pack_off(pack_peer, vec_idx, bank),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
                         dest = peer_vec[peer]
@@ -545,10 +612,10 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 )
                 _store_v4i32_nt_global(dest + byte_off, v4)
 
-        def _wait_flag(flag_rsrc, color):
-            current = _load_i32_uncached(flag_rsrc)
+        def _wait_flag(elem, color):
+            current = _load_i32_uncached(self_rsrc, elem)
             while current != color:
-                current = _load_i32_uncached(flag_rsrc)
+                current = _load_i32_uncached(self_rsrc, elem)
                 _invalidate_l1()
 
         def _wait_release(phase, color):
@@ -556,13 +623,98 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 elem = _sub_tile_i32(phase, tid, fx.Int32(0)) + fx.Int32(
                     release_i32_off
                 )
-                _wait_flag(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        peer_vec[rank] + _i32_to_bytes(elem)
-                    ),
-                    color,
-                )
+                _wait_flag(elem, color)
             gpu.barrier()
+
+        def _bank_of(s):
+            return (fx.Int32(0), s & fx.Int32(1))[n_banks - 1]
+
+        def _wait_before_pack_off(s):
+            return
+
+        def _wait_before_pack_on(s):
+            if s >= fx.Int32(2):
+                rocdl.s_waitcnt(lgkmcnt=0)
+                gpu.barrier()
+
+        _wait_before_pack = (_wait_before_pack_off, _wait_before_pack_on)[n_banks - 1]
+
+        def _wait_after_fanout_on(s, n_this):
+            # Drain this wave's LDS loads, then join the WG.
+            # world_size<8 leaves waves idle in fanout; without the
+            # barrier they pack the next sub-tile into LDS while
+            # a busy wave still ptr_loads it. lgkmcnt only: NT
+            # payload stays in flight until _publish.
+            if (s + fx.Int32(1)) < n_this:
+                rocdl.s_waitcnt(lgkmcnt=0)
+                gpu.barrier()
+
+        def _wait_after_fanout_off(s, n_this):
+            return
+
+        _wait_after_fanout = (_wait_after_fanout_on, _wait_after_fanout_off)[
+            n_banks - 1
+        ]
+
+        def _local_flag_elem(phase, pair_id, kind):
+            return fx.get_scalar(
+                fx.crd2idx(
+                    (fx.Int32(phase), pair_id, fx.Int32(kind)), local_flag_layout
+                )
+            )
+
+        def _local_wait(elem, color):
+            if tid == fx.Int32(0):
+                _wait_flag(elem, color)
+            gpu.barrier()
+
+        def _local_release(elem, color):
+            rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            if tid == fx.Int32(0):
+                buffer_ops.buffer_store(color, self_rsrc, elem, cache_modifier=_CM_SC1)
+
+        def _local_signal(elem, color):
+            if tid == fx.Int32(0):
+                buffer_ops.buffer_store(color, self_rsrc, elem, cache_modifier=_CM_SC1)
+
+        def _join_phase(phase, color):
+            """Publish/wait one RS or AG epoch.
+
+            Default: this CTA publishes its last-sector color and waits
+            every peer. ``cta_batch=2``: even CTA is the remote coordinator
+            for ``(bid, bid^1)``; odd posts a local arrive after its payload
+            drain and never remote-polls. Unpaired last bid (odd tile
+            count) keeps the default handshake.
+            """
+
+            def _default_join():
+                _publish(phase, rank, color)
+                _wait_release(phase, color)
+
+            def _paired_join():
+                pair_id = bid.shrui(fx.Int32(1))
+                arrive = _local_flag_elem(phase, pair_id, LOCAL_ARRIVE)
+                visible = _local_flag_elem(phase, pair_id, LOCAL_VISIBLE)
+                if (bid & fx.Int32(1)) == fx.Int32(0):
+                    _local_wait(arrive, color)
+                    _publish(phase, rank, color)
+                    _wait_release(phase, color)
+                    _local_signal(visible, color)
+                else:
+                    _local_release(arrive, color)
+                    _local_wait(visible, color)
+
+            def _maybe_paired_join():
+                if bid == (num_tiles - fx.Int32(1)):
+                    if (num_tiles & fx.Int32(1)) != fx.Int32(0):
+                        _default_join()
+                    else:
+                        _paired_join()
+                else:
+                    _paired_join()
+
+            (_default_join, _maybe_paired_join)[int(pair_handshake)]()
 
         def _recv_quantized(phase, src, sub, k=0):
             # Packed dword is at base+tid; scale dword is 1024 B later at a
@@ -590,6 +742,56 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                         accs[k] = _codec_dequant(packed, scale, accs[k])
             return accs
 
+        def _reduce_scattered_ready(color, n_this):
+            """Consume each peer's RS payload as soon as its release is visible."""
+            zero = fx.Vector.filled(4, fx.Int32(0), fx.Int32)
+            sub_accs = [[zero] * rank_atoms for _ in range_constexpr(super_tile)]
+
+            processed = fx.Int32(0)
+            all_peers = fx.Int32((1 << world_size) - 1)
+            while processed != all_peers:
+                if wave == fx.Int32(0) and tid < world_size:
+                    own_bit = fx.Int32(1) << tid
+                    if (processed & own_bit) == fx.Int32(0):
+                        elem = _sub_tile_i32(
+                            PHASE_REDUCE_SCATTER, tid, fx.Int32(0)
+                        ) + fx.Int32(release_i32_off)
+                        current = _load_i32_uncached(self_rsrc, elem)
+                        if current == color:
+                            fx.memref_store(color, ready, tid)
+                        else:
+                            _invalidate_l1()
+
+                rocdl.s_waitcnt(lgkmcnt=0)
+                for src in range_constexpr(world_size):
+                    bit = fx.Int32(1) << fx.Int32(src)
+                    if (processed & bit) == fx.Int32(0):
+                        peer_ready = fx.memref_load(ready, fx.Int32(src))
+                        if peer_ready == color:
+                            next_sub_accs = []
+                            for s in range_constexpr(super_tile):
+                                next_accs = sub_accs[s]
+                                if fx.Int32(s) < n_this:
+                                    active_accs = []
+                                    for k in range_constexpr(rank_atoms):
+                                        packed, scale = _recv_quantized(
+                                            PHASE_REDUCE_SCATTER,
+                                            fx.Int32(src),
+                                            fx.Int32(s),
+                                            k,
+                                        )
+                                        active_accs.append(
+                                            _codec_dequant(
+                                                packed, scale, sub_accs[s][k]
+                                            )
+                                        )
+                                    next_accs = active_accs
+                                next_sub_accs.append(next_accs)
+                            sub_accs = next_sub_accs
+                            processed = processed | bit
+            gpu.barrier()
+            return sub_accs
+
         def _recv_all_gather(sub):
             """Dequantize every peer's all-gather packet back into full-tile atoms."""
             gathered = []
@@ -607,20 +809,18 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * fx.Int32(grid)
                 atoms = _load_tile_atoms(tile)
-                _pack_reduce_scatter(atoms)
+                _pack_reduce_scatter(atoms, fx.Int32(0))
                 gpu.barrier()
-                _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
-                _publish(PHASE_REDUCE_SCATTER, rank, color)
+                _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0), fx.Int32(0))
+                _join_phase(PHASE_REDUCE_SCATTER, color)
 
-                _wait_release(PHASE_REDUCE_SCATTER, color)
                 acc = _reduce_scattered(fx.Int32(0))
 
-                _pack_all_gather(acc)
+                _pack_all_gather(acc, fx.Int32(0))
                 gpu.barrier()
-                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
-                _publish(PHASE_ALL_GATHER, rank, color)
+                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0), fx.Int32(0))
+                _join_phase(PHASE_ALL_GATHER, color)
 
-                _wait_release(PHASE_ALL_GATHER, color)
                 gathered = _recv_all_gather(fx.Int32(0))
                 _store_tile_atoms(tile, gathered)
 
@@ -633,32 +833,50 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 remain = n_block_tiles - i
                 n_this = (remain < st_i).select(remain, st_i)
 
+                if (
+                    enable_rs_pipeline
+                    and super_tile == DEFAULT_SUPER_TILE
+                    and world_size == WORLD
+                ):
+                    if tid < world_size:
+                        fx.memref_store(fx.Int32(0), ready, tid)
+                    gpu.barrier()
+
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * fx.Int32(grid)
                     atoms = _load_tile_atoms(tile)
-                    _pack_reduce_scatter(atoms)
+                    bank = _bank_of(s)
+                    _wait_before_pack(s)
+                    _pack_reduce_scatter(atoms, bank)
                     gpu.barrier()
-                    _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
-                    if (s + fx.Int32(1)) < n_this:
-                        # Drain this wave's LDS loads, then join the WG.
-                        # world_size<8 leaves waves idle in fanout; without the
-                        # barrier they pack the next sub-tile into LDS while
-                        # a busy wave still ptr_loads it. lgkmcnt only: NT
-                        # payload stays in flight until _publish.
-                        rocdl.s_waitcnt(lgkmcnt=0)
-                        gpu.barrier()
+                    _fanout_nt(PHASE_REDUCE_SCATTER, rank, s, bank)
+                    _wait_after_fanout(s, n_this)
 
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
-                _wait_release(PHASE_REDUCE_SCATTER, color)
-
-                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    acc = _reduce_scattered(s)
-                    _pack_all_gather(acc)
-                    gpu.barrier()
-                    _fanout_nt(PHASE_ALL_GATHER, rank, s)
-                    if (s + fx.Int32(1)) < n_this:
-                        rocdl.s_waitcnt(lgkmcnt=0)
+                if (
+                    enable_rs_pipeline
+                    and super_tile == DEFAULT_SUPER_TILE
+                    and world_size == WORLD
+                ):
+                    reduced = _reduce_scattered_ready(color, n_this)
+                    for s in range_constexpr(super_tile):
+                        if fx.Int32(s) < n_this:
+                            bank = _bank_of(fx.Int32(s))
+                            _wait_before_pack(fx.Int32(s))
+                            _pack_all_gather(reduced[s], bank)
+                            gpu.barrier()
+                            _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(s), bank)
+                            _wait_after_fanout(fx.Int32(s), n_this)
+                else:
+                    _wait_release(PHASE_REDUCE_SCATTER, color)
+                    for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                        acc = _reduce_scattered(s)
+                        bank = _bank_of(s)
+                        _wait_before_pack(s)
+                        _pack_all_gather(acc, bank)
                         gpu.barrier()
+                        _fanout_nt(PHASE_ALL_GATHER, rank, s, bank)
+                        _wait_after_fanout(s, n_this)
 
                 _publish(PHASE_ALL_GATHER, rank, color)
                 _wait_release(PHASE_ALL_GATHER, color)
@@ -704,16 +922,24 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             stream=stream,
         )
 
-    launch_qr_int4.func.__name__ = f"launch_qr_int4_ws{world_size}_st{super_tile}"
+    name = f"launch_qr_int4_ws{world_size}_st{super_tile}"
+    kname = f"qr_int4_ws{world_size}_st{super_tile}"
+    if n_banks == 2:
+        name += "_pp"
+        kname += "_pp"
+    if pair_handshake:
+        name += f"_b{cta_batch}"
+        kname += f"_b{cta_batch}"
+    launch_qr_int4.func.__name__ = name
     try:
-        qr_int4.func.__name__ = f"qr_int4_ws{world_size}_st{super_tile}"
+        qr_int4.func.__name__ = kname
     except AttributeError:
         pass
     return {
         "launch": launch_qr_int4,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
-        "lds_bytes": LDS_BYTES,
+        "lds_bytes": LDS_BYTES_2BANK if n_banks == 2 else LDS_BYTES,
         "tile_bytes": TILE_BYTES,
         "tile_fp16": TILE_FP16,
         "rank_tile_bytes": RANK_TILE_BYTES,
@@ -723,4 +949,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": BLOCK,
+        "n_banks": n_banks,
+        "cta_batch": cta_batch,
+        "enable_pack_pipeline": bool(enable_pack_pipeline),
     }

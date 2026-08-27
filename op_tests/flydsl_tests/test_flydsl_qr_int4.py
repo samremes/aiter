@@ -43,8 +43,10 @@ from aiter.test_common import benchmark, run_perftest
 
 pytest.importorskip("flydsl")
 
-from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
+from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP, select_super_tile
 from aiter.ops.flydsl.kernels.qr_int4_kernel import (
+    DEFAULT_SUPER_TILE,
+    GRID_AWARE_SUPER_TILE,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
@@ -53,7 +55,7 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
-SUPER_TILE = 8
+SUPER_TILE = DEFAULT_SUPER_TILE
 TP = WORLD
 
 pytestmark = pytest.mark.skipif(
@@ -89,11 +91,43 @@ def _pick_st(
     requested: int = SUPER_TILE,
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
+    arch: str = ARCH,
+    world_size: int = TP,
 ) -> int:
-    tiles = _num_tiles(tokens, hidden)
-    if requested == 1 or tiles > grid_cap:
-        return requested
-    return 1
+    return select_super_tile(
+        _num_tiles(tokens, hidden),
+        grid=grid_cap,
+        fallback_st=requested,
+        arch=arch,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_tiles", "grid_cap", "arch", "world_size", "enable_st9", "expected"),
+    [
+        (1216, 1216, "gfx950", 8, False, 1),
+        (1217, 1216, "gfx950", 8, False, DEFAULT_SUPER_TILE),
+        (10240, 1216, "gfx950", 8, False, DEFAULT_SUPER_TILE),
+        (10240, 1216, "gfx942", 8, False, DEFAULT_SUPER_TILE),
+        (10240, 1024, "gfx950", 8, False, DEFAULT_SUPER_TILE),
+        (9729, 1216, "gfx950", 8, True, GRID_AWARE_SUPER_TILE),
+        (10240, 1216, "gfx950", 8, True, GRID_AWARE_SUPER_TILE),
+        (10945, 1216, "gfx950", 8, True, DEFAULT_SUPER_TILE),
+    ],
+)
+def test_select_super_tile(num_tiles, grid_cap, arch, world_size, enable_st9, expected):
+    assert (
+        select_super_tile(
+            num_tiles,
+            grid=grid_cap,
+            fallback_st=DEFAULT_SUPER_TILE,
+            arch=arch,
+            world_size=world_size,
+            enable_st9=enable_st9,
+        )
+        == expected
+    )
 
 
 def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
@@ -138,6 +172,8 @@ def _run_rank(args) -> None:
         world_size=args.tp,
         super_tile=args.super_tile,
         grid_cap=args.grid_cap,
+        enable_pack_pipeline=bool(args.pack_pipeline),
+        cta_batch=int(args.cta_batch),
     )
     compile_tokens = min(512, max(args.tokens))
     compile_hidden = max(args.hiddens)
@@ -165,7 +201,10 @@ def _run_rank(args) -> None:
         fly.allreduce(inp, out)
         torch.cuda.synchronize()
         dist.barrier()
-        got = out.to(torch.float32)
+        got = out.to(torch.float32).cpu()
+        ref_cpu = ref.cpu()
+        del ref
+        torch.cuda.empty_cache()
         nbytes = int(inp.numel()) * int(inp.element_size())
         tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
         row = {
@@ -173,8 +212,10 @@ def _run_rank(args) -> None:
             "hidden": hidden,
             "grid_cap": args.grid_cap,
             "st_used": fly._pick_st(tiles),
-            "sqnr_db": _sqnr_db(got, ref),
-            "rel_mae": _rel_mae(got, ref),
+            "cta_batch": int(args.cta_batch),
+            "pack_pipeline": int(bool(args.pack_pipeline)),
+            "sqnr_db": _sqnr_db(got, ref_cpu),
+            "rel_mae": _rel_mae(got, ref_cpu),
             "us": None,
         }
         if args.time_it:
@@ -188,7 +229,7 @@ def _run_rank(args) -> None:
             _, us = run_perftest(_allreduce)
             row["us"] = us
         rows.append(row)
-        del inp, out, ref, got
+        del inp, out, got, ref_cpu
         torch.cuda.empty_cache()
 
     gathered = [None] * args.tp
@@ -208,6 +249,8 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
+    cta_batch: int | None = None,
+    pack_pipeline: bool | None = None,
 ) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
@@ -218,6 +261,16 @@ def _spawn(
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
         pytest.skip(f"QRInt4 needs {world_size} GPUs, have {n_gpu}")
+    if cta_batch is None:
+        cta_batch = int(os.environ.get("QR_INT4_CTA_BATCH", "1"))
+    if pack_pipeline is None:
+        pack_pipeline = os.environ.get("QR_INT4_PACK_PIPELINE", "0") in (
+            "1",
+            "true",
+            "True",
+        )
+    cta_batch = int(cta_batch)
+    pack_pipeline = bool(pack_pipeline)
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_int4_"), "rank0.json")
     env = dict(os.environ)
@@ -248,7 +301,11 @@ def _spawn(
             str(super_tile),
             "--grid-cap",
             str(grid_cap),
+            "--cta-batch",
+            str(cta_batch),
         ]
+        if pack_pipeline:
+            cmd.append("--pack-pipeline")
         if time_it:
             cmd.append("--time-it")
         if rank == 0:
@@ -336,8 +393,23 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
 
 
 @benchmark()
-def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
-    ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
+def test_qr_int4(
+    tokens,
+    hidden,
+    dtype,
+    tp,
+    grid_cap=DEFAULT_GRID_CAP,
+    cta_batch=1,
+    pack_pipeline=0,
+):
+    ranks = _spawn(
+        tp,
+        [(tokens, hidden)],
+        time_it=True,
+        grid_cap=grid_cap,
+        cta_batch=int(cta_batch),
+        pack_pipeline=bool(pack_pipeline),
+    )
     row = _assert_sqnr(
         ranks,
         tokens=tokens,
@@ -354,6 +426,8 @@ def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
         "tp": tp,
         "grid_cap": row["grid_cap"],
         "st_used": row["st_used"],
+        "cta_batch": int(cta_batch),
+        "pack_pipeline": int(bool(pack_pipeline)),
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
         "flydsl TB/s": (nbytes / us / 1e6) if us else 0.0,
@@ -423,6 +497,20 @@ def main():
         default=DEFAULT_GRID_CAP,
         help="Persistent launch/inbox block cap (default 304*4=1216, matches HIP QR).",
     )
+    parser.add_argument(
+        "--cta-batch",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="ST=1 paired-CTA handshake B (1=off, 2=pair). Default 1.",
+    )
+    parser.add_argument(
+        "--pack-pipeline",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="ST≥2 two-bank pack/NT overlap (0=off, 1=on). Default 0.",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
@@ -430,7 +518,9 @@ def main():
             aiter.logger.warning("QRInt4 payload is bf16; skipping %s", dtype)
             continue
         df = []
-        for tp, batch, mnk in itertools.product(args.tp, args.batch, args.mnk):
+        for tp, batch, mnk, cta_batch, pack_pipeline in itertools.product(
+            args.tp, args.batch, args.mnk, args.cta_batch, args.pack_pipeline
+        ):
             if batch != 1:
                 continue
             if tp not in SUPPORTED_WORLDS:
@@ -447,7 +537,17 @@ def main():
             if not isinstance(mnk, tuple) or len(mnk) < 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
-            df.append(test_qr_int4(tokens, hidden, dtype, tp, grid_cap=args.grid_cap))
+            df.append(
+                test_qr_int4(
+                    tokens,
+                    hidden,
+                    dtype,
+                    tp,
+                    grid_cap=args.grid_cap,
+                    cta_batch=int(cta_batch),
+                    pack_pipeline=int(pack_pipeline),
+                )
+            )
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
@@ -489,8 +589,12 @@ if __name__ == "__main__":
     if known.rank is not None:
         rank_parser = argparse.ArgumentParser()
         rank_parser.add_argument("--tp", type=int, default=TP)
+        rank_parser.add_argument("--cta-batch", type=int, default=1)
+        rank_parser.add_argument("--pack-pipeline", action="store_true")
         rank_args, _ = rank_parser.parse_known_args(rest)
         known.tp = rank_args.tp
+        known.cta_batch = rank_args.cta_batch
+        known.pack_pipeline = rank_args.pack_pipeline
         known.tokens = [int(t) for t in known.tokens.split(",") if t]
         known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
         if len(known.tokens) != len(known.hiddens):
