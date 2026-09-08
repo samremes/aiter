@@ -10,9 +10,12 @@ import torch
 from aiter.ops.topk import top_k_per_row_decode
 
 from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
+    MTP_REUSE_MAX_ROWS,
     SUPPORTED_K,
+    WORKGROUPS_PER_CU,
     launch_fp8_paged_mqa_local_topk,
 )
+from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
 
 SUPPORTED_ARCHES = ("gfx950",)
 
@@ -47,7 +50,15 @@ def _normalize_context_lens(
     context_lens: torch.Tensor, batch: int, next_n: int
 ) -> torch.Tensor:
     if context_lens.shape == (batch,):
-        return context_lens.repeat_interleave(next_n)
+        if next_n == 1:
+            return context_lens
+        offsets = torch.arange(
+            1 - next_n,
+            1,
+            dtype=torch.int32,
+            device=context_lens.device,
+        )
+        return (context_lens[:, None] + offsets).clamp_min_(0).reshape(-1)
     if context_lens.shape == (batch, next_n):
         return context_lens.reshape(batch * next_n)
     raise ValueError(
@@ -58,9 +69,20 @@ def _normalize_context_lens(
 
 def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
     rows = q_fp8.shape[0] * q_fp8.shape[1]
+    next_n = q_fp8.shape[1]
     cu_count = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
-    target_blocks = 4 * cu_count
-    occupancy_splits = max(1, (target_blocks + rows - 1) // rows)
+    rows_per_cta = (
+        next_n
+        if 2 <= next_n <= 4 and rows <= MTP_REUSE_MAX_ROWS
+        else 1
+    )
+    row_groups = rows // rows_per_cta
+    workgroups_per_cu = WORKGROUPS_PER_CU if rows_per_cta == 1 else 1
+    target_blocks = workgroups_per_cu * cu_count
+    occupancy_splits = max(
+        1,
+        (target_blocks + row_groups - 1) // row_groups,
+    )
     useful_splits = max(1, (max_history + k - 1) // k)
     return min(128, occupancy_splits, useful_splits)
 
@@ -198,6 +220,143 @@ def flydsl_fp8_paged_mqa_local_topk(
     return candidate_scores, candidate_positions, candidate_counts
 
 
+def flydsl_fp8_paged_mqa_topk(
+    q_fp8,
+    kv_cache,
+    k_scales,
+    weights,
+    context_lens,
+    block_tables,
+    *,
+    k=2048,
+    num_splits=None,
+):
+    """Compute exact TopK through compact split-local candidate bags."""
+    for name, tensor in (
+        ("q_fp8", q_fp8),
+        ("kv_cache", kv_cache),
+        ("k_scales", k_scales),
+        ("weights", weights),
+        ("context_lens", context_lens),
+        ("block_tables", block_tables),
+    ):
+        _require_cuda_contiguous(name, tensor)
+
+    device = q_fp8.device
+    if any(
+        tensor.device != device
+        for tensor in (
+            kv_cache,
+            k_scales,
+            weights,
+            context_lens,
+            block_tables,
+        )
+    ):
+        raise ValueError("all inputs must be on the same device")
+    if q_fp8.ndim != 4:
+        raise ValueError(
+            "this specialization requires q_fp8 shape [B,next_n,32,128], "
+            f"got {tuple(q_fp8.shape)}"
+        )
+    batch, next_n, heads, head_dim = q_fp8.shape
+    if next_n not in (1, 2, 3, 4) or (heads, head_dim) != (32, 128):
+        raise ValueError(
+            "this specialization requires q_fp8 shape [B,next_n,32,128] "
+            "with next_n in [1,4], "
+            f"got {tuple(q_fp8.shape)}"
+        )
+    rows = batch * next_n
+    if q_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"q_fp8 must be float8_e4m3fn, got {q_fp8.dtype}")
+    if kv_cache.ndim != 3 or kv_cache.shape[1:] != (64, 128):
+        raise ValueError(
+            "this specialization requires preshuffled kv_cache shape "
+            f"[pages,64,128], got {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.dtype != q_fp8.dtype:
+        raise ValueError("kv_cache dtype must match q_fp8")
+    if k_scales.shape != kv_cache.shape[:2] or k_scales.dtype != torch.float32:
+        raise ValueError("k_scales must be float32 [pages,64]")
+    if weights.shape != (rows, 32) or weights.dtype != torch.float32:
+        raise ValueError(f"weights must be float32 with shape {(rows, 32)}")
+    if context_lens.dtype != torch.int32:
+        raise ValueError(f"context_lens must be int32, got {context_lens.dtype}")
+    if (
+        block_tables.ndim != 2
+        or block_tables.shape[0] != batch
+        or block_tables.dtype != torch.int32
+    ):
+        raise ValueError("block_tables must be int32 [B,max_pages]")
+    if k not in SUPPORTED_K:
+        raise ValueError(f"k must be one of {SUPPORTED_K}, got {k}")
+
+    arch = _arch_name(device)
+    row_context_lens = _normalize_context_lens(
+        context_lens,
+        batch,
+        next_n,
+    )
+    max_history = block_tables.shape[1] * 64
+    if num_splits is None:
+        num_splits = _auto_num_splits(q_fp8, max_history, k)
+    if not isinstance(num_splits, int) or num_splits <= 0:
+        raise ValueError(f"num_splits must be a positive integer, got {num_splits}")
+    max_split_span = (max_history + num_splits - 1) // num_splits
+    if max_split_span > 65535:
+        raise ValueError(
+            "each Stage-A split must span at most 65535 positions for the "
+            f"uint16 local-position reservoir; got at most {max_split_span}"
+        )
+
+    candidate_scores = torch.empty(
+        (rows, num_splits, k),
+        dtype=torch.float32,
+        device=device,
+    )
+    candidate_positions = torch.empty(
+        (rows, num_splits, k),
+        dtype=torch.int32,
+        device=device,
+    )
+    candidate_counts = torch.empty(
+        (rows, num_splits),
+        dtype=torch.int32,
+        device=device,
+    )
+    workspace = split_topk_merge_workspace(device, rows)
+    stream = torch.cuda.current_stream(device)
+    with torch.cuda.device(device):
+        launch_fp8_paged_mqa_local_topk(
+            q_fp8,
+            kv_cache,
+            k_scales,
+            weights,
+            row_context_lens,
+            block_tables,
+            candidate_scores,
+            candidate_positions,
+            candidate_counts,
+            topk=k,
+            num_splits=num_splits,
+            preshuffled=True,
+            arch=arch,
+            stream=stream,
+            prepare_merge=True,
+            merge_histogram=workspace[0],
+            merge_state=workspace[1],
+        )
+        values, positions = split_topk_merge(
+            candidate_scores,
+            candidate_positions,
+            candidate_counts,
+            k=k,
+            precomputed_first_pass=True,
+            workspace=workspace,
+        )
+    return values, positions
+
+
 def merge_local_topk_candidates(
     candidate_scores: torch.Tensor,
     candidate_positions: torch.Tensor,
@@ -220,6 +379,13 @@ def merge_local_topk_candidates(
         raise ValueError("candidate_counts must have shape [rows,splits]")
     if k > splits * local_k:
         raise ValueError(f"k={k} exceeds candidate width {splits * local_k}")
+    if k == 2048 and local_k == k and splits > 1:
+        return split_topk_merge(
+            candidate_scores,
+            candidate_positions,
+            candidate_counts,
+            k=k,
+        )
 
     merge_scores = candidate_scores.reshape(rows, splits * local_k)
     merge_positions = candidate_positions.reshape(rows, splits * local_k)

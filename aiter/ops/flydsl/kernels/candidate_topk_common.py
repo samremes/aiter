@@ -33,7 +33,12 @@ _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
 
-def make_streaming_topk_storage(pool_capacity, state_size, index_type=fx.Int32):
+def make_streaming_topk_storage(
+    pool_capacity,
+    state_size,
+    index_type=fx.Int32,
+    num_waves=NUM_WAVES,
+):
     """Create a statically sized LDS carrier outside postponed annotations."""
 
     @fx.struct
@@ -41,7 +46,7 @@ def make_streaming_topk_storage(pool_capacity, state_size, index_type=fx.Int32):
         pool_values: fx.Array[fx.Float32, pool_capacity, 16]
         pool_indices: fx.Array[index_type, pool_capacity, 16]
         histogram: fx.Array[fx.Int32, NUM_HIST_BINS, 16]
-        scan: fx.Array[fx.Int32, NUM_WAVES + 1, 16]
+        scan: fx.Array[fx.Int32, num_waves + 1, 16]
         state: fx.Array[fx.Int32, state_size, 16]
 
     return StreamingTopKStorage
@@ -119,26 +124,34 @@ def warp_inclusive_prefix_i32(value, lane):
     return (lane >= fx.Int32(32)).select(value + fx.Int32(remote32), value)
 
 
-@flyc.jit
-def block_exclusive_prefix_i32(tid, value, scan):
-    """Return ``(exclusive_prefix, block_total)`` for one i32 per thread."""
-    lane = tid % fx.Int32(WAVE_SIZE)
-    wave = tid // fx.Int32(WAVE_SIZE)
-    inclusive = warp_inclusive_prefix_i32(value, lane)
-    exclusive = inclusive - value
-    if lane == fx.Int32(WAVE_SIZE - 1):
-        scan[wave] = inclusive
-    gpu.barrier()
+def make_block_exclusive_prefix_i32(num_waves):
+    """Build a block exclusive prefix over ``num_waves`` wave-64 groups."""
 
-    cross_wave = fx.Int32(0)
-    total = fx.Int32(0)
-    for wave_index in range(NUM_WAVES):
-        wave_total = scan[wave_index]
-        cross_wave = (wave > fx.Int32(wave_index)).select(
-            cross_wave + wave_total,
-            cross_wave,
-        )
-        total = total + wave_total
-    result = cross_wave + exclusive
-    gpu.barrier()
-    return result, total
+    @flyc.jit
+    def block_exclusive_prefix_i32(tid, value, scan):
+        """Return ``(exclusive_prefix, block_total)`` for one i32 per thread."""
+        lane = tid % fx.Int32(WAVE_SIZE)
+        wave = tid // fx.Int32(WAVE_SIZE)
+        inclusive = warp_inclusive_prefix_i32(value, lane)
+        exclusive = inclusive - value
+        if lane == fx.Int32(WAVE_SIZE - 1):
+            scan[wave] = inclusive
+        gpu.barrier()
+
+        cross_wave = fx.Int32(0)
+        total = fx.Int32(0)
+        for wave_index in range(num_waves):
+            wave_total = scan[wave_index]
+            cross_wave = (wave > fx.Int32(wave_index)).select(
+                cross_wave + wave_total,
+                cross_wave,
+            )
+            total = total + wave_total
+        result = cross_wave + exclusive
+        gpu.barrier()
+        return result, total
+
+    return block_exclusive_prefix_i32
+
+
+block_exclusive_prefix_i32 = make_block_exclusive_prefix_i32(NUM_WAVES)
