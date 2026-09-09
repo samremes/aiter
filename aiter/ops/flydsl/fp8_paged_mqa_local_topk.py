@@ -13,7 +13,6 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     NUM_XCD,
     SUPPORTED_K,
     WORKGROUPS_PER_CU,
-    grouped_rows_per_cta,
     launch_fp8_paged_mqa_local_topk,
 )
 from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
@@ -71,13 +70,9 @@ def _normalize_context_lens(
 _MAX_AUTO_SPLIT_SPAN = 32768
 
 
-def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
-    rows = q_fp8.shape[0] * q_fp8.shape[1]
-    next_n = q_fp8.shape[1]
-    cu_count = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
-    rows_per_cta = grouped_rows_per_cta(next_n, rows)
-    row_groups = max(1, rows // rows_per_cta)
-    workgroups_per_cu = WORKGROUPS_PER_CU if rows_per_cta == 1 else 1
+def _plan_num_splits(rows: int, max_history: int, k: int, cu_count: int) -> int:
+    row_groups = max(1, rows)
+    workgroups_per_cu = WORKGROUPS_PER_CU
     target_blocks = workgroups_per_cu * cu_count
     occupancy_splits = max(
         1,
@@ -90,8 +85,16 @@ def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
         if span <= _MAX_AUTO_SPLIT_SPAN:
             break
         splits += 1
+    if splits < NUM_XCD:
+        return splits
     aligned = min(128, (splits + NUM_XCD - 1) // NUM_XCD * NUM_XCD)
-    return max(1, aligned)
+    return aligned
+
+
+def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
+    rows = q_fp8.shape[0] * q_fp8.shape[1]
+    cu_count = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
+    return _plan_num_splits(rows, max_history, k, cu_count)
 
 
 def flydsl_fp8_paged_mqa_local_topk(
@@ -331,7 +334,7 @@ def flydsl_fp8_paged_mqa_topk(
         dtype=torch.int32,
         device=device,
     )
-    workspace = split_topk_merge_workspace(device, rows)
+    workspace = split_topk_merge_workspace(device, rows) if num_splits > 1 else None
     stream = torch.cuda.current_stream(device)
     with torch.cuda.device(device):
         launch_fp8_paged_mqa_local_topk(
@@ -349,18 +352,22 @@ def flydsl_fp8_paged_mqa_topk(
             preshuffled=True,
             arch=arch,
             stream=stream,
-            prepare_merge=True,
-            merge_histogram=workspace[0],
-            merge_state=workspace[1],
+            prepare_merge=workspace is not None,
+            merge_histogram=workspace[0] if workspace is not None else None,
+            merge_state=workspace[1] if workspace is not None else None,
         )
-        values, positions = split_topk_merge(
-            candidate_scores,
-            candidate_positions,
-            candidate_counts,
-            k=k,
-            precomputed_first_pass=True,
-            workspace=workspace,
-        )
+        if workspace is None:
+            values = candidate_scores[:, 0]
+            positions = candidate_positions[:, 0]
+        else:
+            values, positions = split_topk_merge(
+                candidate_scores,
+                candidate_positions,
+                candidate_counts,
+                k=k,
+                precomputed_first_pass=True,
+                workspace=workspace,
+            )
     return values, positions
 
 
