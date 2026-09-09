@@ -59,16 +59,23 @@ if MTP_REUSE_MAX_ROWS <= 0:
     raise ValueError("AITER_STAGE_A_MTP_REUSE_MAX_ROWS must be positive")
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "0") in ("1", "true", "True", "yes", "YES")
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    fallback = "1" if default else "0"
+    return os.environ.get(name, fallback) in ("1", "true", "True", "yes", "YES")
 
 
 # Diagnostic-only compile switches. Default keeps exact Stage A.
 SKIP_COMPACT = _env_flag("AITER_STAGE_A_SKIP_COMPACT")
 SKIP_CANDIDATE_WRITES = _env_flag("AITER_STAGE_A_SKIP_CANDIDATE_WRITES")
 SKIP_EPILOGUE = _env_flag("AITER_STAGE_A_SKIP_EPILOGUE")
+# The measured winner for two-row CTAs. Set the environment variable to 0 to
+# retain the streaming implementation for diagnostics.
+MTP2_FULL_SPLIT_SELECT = _env_flag(
+    "AITER_STAGE_A_MTP2_FULL_SPLIT_SELECT", default=True
+)
 WORKGROUPS_PER_CU = 16 // PROFILE_WAVES
 SUPPORTED_K = (128, 512, 1024, 2048)
+FULL_SPLIT_CAPACITY = 16384
 
 _RETAINED = 0
 _SCORE_PREFIX = 1
@@ -84,6 +91,20 @@ _MERGE_DIRECT = 5
 _PACK_SHIFT = 16
 _PACK_MASK = (1 << _PACK_SHIFT) - 1
 _NEUTRAL_E8M0 = 0x7F7F7F7F
+
+
+def _make_full_split_storage(state_size):
+    """Create score-only LDS storage for two full 16K splits."""
+
+    @fx.struct
+    class FullSplitStorage:
+        pool_values: fx.Array[fx.Float32, 2 * FULL_SPLIT_CAPACITY, 16]
+        pool_indices: fx.Array[fx.Uint16, 1, 16]
+        histogram: fx.Array[fx.Int32, NUM_HIST_BINS, 16]
+        scan: fx.Array[fx.Int32, WAVES + 1, 16]
+        state: fx.Array[fx.Int32, state_size, 16]
+
+    return FullSplitStorage
 
 
 def _udiv(a, b):
@@ -149,6 +170,7 @@ def compile_fp8_paged_mqa_local_topk(
     page_size: int,
     rows_per_cta: int = 1,
     prepare_merge: bool = False,
+    full_split_select: bool = False,
     skip_compact: bool = False,
     skip_candidate_writes: bool = False,
     skip_epilogue: bool = False,
@@ -157,9 +179,9 @@ def compile_fp8_paged_mqa_local_topk(
     if topk not in SUPPORTED_K:
         raise ValueError(f"topk must be one of {SUPPORTED_K}, got {topk}")
     if rows_per_cta not in (1, 2, 3, 4):
-        raise ValueError(
-            f"rows_per_cta must be in [1,4], got {rows_per_cta}"
-        )
+        raise ValueError(f"rows_per_cta must be in [1,4], got {rows_per_cta}")
+    if full_split_select and rows_per_cta != 2:
+        raise ValueError("full_split_select requires rows_per_cta=2")
     if arch != "gfx950":
         raise RuntimeError(
             "the initial native-e4m3fn Stage-A specialization supports gfx950 only"
@@ -172,20 +194,28 @@ def compile_fp8_paged_mqa_local_topk(
         4: MTP4_TILES_PER_COMPACT,
     }[rows_per_cta]
     incoming_capacity = tiles_per_compact * BLOCK_N
-    pool_capacity = topk + incoming_capacity
+    pool_capacity = (
+        FULL_SPLIT_CAPACITY if full_split_select else topk + incoming_capacity
+    )
+    index_capacity = 1 if full_split_select else rows_per_cta * pool_capacity
     pool_steps = (pool_capacity + BLOCK_THREADS - 1) // BLOCK_THREADS
     output_steps = (topk + BLOCK_THREADS - 1) // BLOCK_THREADS
-    storage_type = make_streaming_topk_storage(
-        rows_per_cta * pool_capacity,
-        rows_per_cta * _STATE_SIZE,
-        fx.Uint16,
-        num_waves=WAVES,
+    storage_type = (
+        _make_full_split_storage(rows_per_cta * _STATE_SIZE)
+        if full_split_select
+        else make_streaming_topk_storage(
+            rows_per_cta * pool_capacity,
+            rows_per_cta * _STATE_SIZE,
+            fx.Uint16,
+            num_waves=WAVES,
+        )
     )
     block_exclusive_prefix_i32 = make_block_exclusive_prefix_i32(WAVES)
     layout_name = "preshuffled" if preshuffled else "rowmajor"
     kernel_name = (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}_"
         f"w{WAVES}_bn{BLOCK_N}_r{rows_per_cta}_inc{incoming_capacity}_"
+        f"{f'fs{int(full_split_select)}_' if rows_per_cta == 2 else ''}"
         f"pm{int(prepare_merge)}_sc{int(skip_compact)}_"
         f"sw{int(skip_candidate_writes)}_se{int(skip_epilogue)}_{arch}"
     )
@@ -249,13 +279,11 @@ def compile_fp8_paged_mqa_local_topk(
             fx.make_layout(rows_per_cta * pool_capacity, 1)
         )
         pool_indices = storage.pool_indices.peek().view(
-            fx.make_layout(rows_per_cta * pool_capacity, 1)
+            fx.make_layout(index_capacity, 1)
         )
         histogram = storage.histogram.peek().view(fx.make_layout(NUM_HIST_BINS, 1))
         scan = storage.scan.peek().view(fx.make_layout(WAVES + 1, 1))
-        state = storage.state.peek().view(
-            fx.make_layout(rows_per_cta * _STATE_SIZE, 1)
-        )
+        state = storage.state.peek().view(fx.make_layout(rows_per_cta * _STATE_SIZE, 1))
 
         valid_lens = [
             fx.Int32(lengths[row_base + fx.Int32(row_in_group)])
@@ -263,9 +291,9 @@ def compile_fp8_paged_mqa_local_topk(
         ]
         group_valid_len = valid_lens[0]
         for row_in_group in range_constexpr(1, rows_per_cta):
-            group_valid_len = (
-                valid_lens[row_in_group] > group_valid_len
-            ).select(valid_lens[row_in_group], group_valid_len)
+            group_valid_len = (valid_lens[row_in_group] > group_valid_len).select(
+                valid_lens[row_in_group], group_valid_len
+            )
         split_begin = _udiv(group_valid_len * split, num_splits)
         split_end = _udiv(
             group_valid_len * (split + fx.Int32(1)),
@@ -295,9 +323,7 @@ def compile_fp8_paged_mqa_local_topk(
                 )
                 for ii in range_constexpr(DREG):
                     head = mi * MFMA_M + lane_div_16 * DREG + ii
-                    weight_frags[row_in_group][mi][ii] = fx.Float32(
-                        weight_t[row, head]
-                    )
+                    weight_frags[row_in_group][mi][ii] = fx.Float32(weight_t[row, head])
 
         def _compact(
             pool_count,
@@ -332,12 +358,8 @@ def compile_fp8_paged_mqa_local_topk(
                     pool_pos = fx.Int32(step * BLOCK_THREADS) + tid
                     live = pool_pos < pool_count
                     safe_pos = live.select(pool_pos, fx.Int32(0))
-                    score_ord = f32_to_ordered_i32(
-                        pool_values[pool_base + safe_pos]
-                    )
-                    prefix_match = live & (
-                        (score_ord & score_mask) == score_prefix
-                    )
+                    score_ord = f32_to_ordered_i32(pool_values[pool_base + safe_pos])
+                    prefix_match = live & ((score_ord & score_mask) == score_prefix)
                     if prefix_match:
                         bucket = radix_bucket(score_ord, radix_pass) ^ fx.Int32(
                             xor_value
@@ -345,9 +367,7 @@ def compile_fp8_paged_mqa_local_topk(
                         atomic_add_i32(histogram, 1, bucket, "workgroup")
                 gpu.barrier()
 
-                selected_high = (
-                    fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
-                )
+                selected_high = fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
                 bin_counts = [
                     histogram[selected_high - fx.Int32(bin_item)]
                     for bin_item in range_constexpr(bins_per_thread)
@@ -355,17 +375,13 @@ def compile_fp8_paged_mqa_local_topk(
                 group_count = fx.Int32(0)
                 for bin_item in range_constexpr(bins_per_thread):
                     group_count = group_count + bin_counts[bin_item]
-                before_group, _ = block_exclusive_prefix_i32(
-                    tid, group_count, scan
-                )
+                before_group, _ = block_exclusive_prefix_i32(tid, group_count, scan)
                 before_bin = before_group
                 remaining = state[state_base + _REMAINING]
                 for bin_item in range_constexpr(bins_per_thread):
                     selected = selected_high - fx.Int32(bin_item)
                     bin_count = bin_counts[bin_item]
-                    if (before_bin < remaining) & (
-                        before_bin + bin_count >= remaining
-                    ):
+                    if (before_bin < remaining) & (before_bin + bin_count >= remaining):
                         actual = selected ^ fx.Int32(xor_value)
                         pass_mask, shift = prefix_radix_mask(radix_pass)
                         state[state_base + _SCORE_PREFIX] = score_prefix | (
@@ -415,13 +431,165 @@ def compile_fp8_paged_mqa_local_topk(
                 state[state_base + _RETAINED] = fx.Int32(topk)
             gpu.barrier()
 
+        def _full_split_select(
+            pool_count,
+            pool_base,
+            state_base,
+            state,
+            histogram,
+            scan,
+            pool_values,
+            output_scores_row,
+            output_positions_row,
+            merge_histogram_row,
+            merge_state_row,
+            valid_len,
+        ):
+            if tid == 0:
+                state[state_base + _SCORE_PREFIX] = 0
+                state[state_base + _SCORE_MASK] = 0
+                state[state_base + _REMAINING] = fx.Int32(topk)
+            gpu.barrier()
+
+            for radix_pass in range_constexpr(NUM_RADIX_PASSES):
+                pass_bits = radix_pass_bits(radix_pass)
+                num_bins = 1 << pass_bits
+                bins_per_thread = num_bins // BLOCK_THREADS
+                for hist_step in range_constexpr(
+                    (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                ):
+                    histogram[hist_step * BLOCK_THREADS + tid] = 0
+                gpu.barrier()
+                score_prefix = state[state_base + _SCORE_PREFIX]
+                score_mask = state[state_base + _SCORE_MASK]
+                xor_value = RADIX_SIGN_BIT if radix_pass == 0 else 0
+
+                for step in range_constexpr(pool_steps):
+                    pool_pos = fx.Int32(step * BLOCK_THREADS) + tid
+                    live = pool_pos < pool_count
+                    safe_pos = live.select(pool_pos, fx.Int32(0))
+                    score_ord = f32_to_ordered_i32(pool_values[pool_base + safe_pos])
+                    prefix_match = live & ((score_ord & score_mask) == score_prefix)
+                    if prefix_match:
+                        bucket = radix_bucket(score_ord, radix_pass) ^ fx.Int32(
+                            xor_value
+                        )
+                        atomic_add_i32(histogram, 1, bucket, "workgroup")
+                gpu.barrier()
+
+                selected_high = fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
+                bin_counts = [
+                    histogram[selected_high - fx.Int32(bin_item)]
+                    for bin_item in range_constexpr(bins_per_thread)
+                ]
+                group_count = fx.Int32(0)
+                for bin_item in range_constexpr(bins_per_thread):
+                    group_count = group_count + bin_counts[bin_item]
+                before_group, _ = block_exclusive_prefix_i32(tid, group_count, scan)
+                before_bin = before_group
+                remaining = state[state_base + _REMAINING]
+                for bin_item in range_constexpr(bins_per_thread):
+                    selected = selected_high - fx.Int32(bin_item)
+                    bin_count = bin_counts[bin_item]
+                    if (before_bin < remaining) & (before_bin + bin_count >= remaining):
+                        actual = selected ^ fx.Int32(xor_value)
+                        pass_mask, shift = prefix_radix_mask(radix_pass)
+                        state[state_base + _SCORE_PREFIX] = score_prefix | (
+                            actual << fx.Int32(shift)
+                        )
+                        state[state_base + _SCORE_MASK] = score_mask | pass_mask
+                        state[state_base + _REMAINING] = remaining - before_bin
+                    before_bin = before_bin + bin_count
+                gpu.barrier()
+
+            threshold = state[state_base + _SCORE_PREFIX]
+            equal_needed = state[state_base + _REMAINING]
+            write_cursor = fx.Int32(0)
+            equal_seen = fx.Int32(0)
+            for step in range_constexpr(output_steps):
+                slot = fx.Int32(step * BLOCK_THREADS) + tid
+                if slot < fx.Int32(topk):
+                    output_scores_row[slot] = fx.Float32(float("-inf"))
+                    output_positions_row[slot] = fx.Int32(-1)
+            for hist_step in range_constexpr(
+                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+            ):
+                histogram[hist_step * BLOCK_THREADS + tid] = 0
+            if prepare_merge and split == 0 and tid == 0:
+                merge_state_row[_MERGE_PREFIX] = 0
+                merge_state_row[_MERGE_MASK] = 0
+                merge_state_row[_MERGE_REMAINING] = _imin(
+                    valid_len,
+                    fx.Int32(topk),
+                )
+                merge_state_row[_MERGE_WRITE_COUNTER] = 0
+                merge_state_row[_MERGE_EQ_COUNTER] = 0
+                merge_state_row[_MERGE_DIRECT] = 0
+            gpu.barrier()
+
+            for step in range_constexpr(pool_steps):
+                pool_pos = fx.Int32(step * BLOCK_THREADS) + tid
+                live = pool_pos < pool_count
+                safe_pos = live.select(pool_pos, fx.Int32(0))
+                value = pool_values[pool_base + safe_pos]
+                score_ord = f32_to_ordered_i32(value)
+                better = live & (score_ord > threshold)
+                equal = live & (score_ord == threshold)
+                better_i32 = better.select(fx.Int32(1), fx.Int32(0))
+                equal_i32 = equal.select(fx.Int32(1), fx.Int32(0))
+                packed = (better_i32 << fx.Int32(_PACK_SHIFT)) + equal_i32
+                packed_before, packed_total = block_exclusive_prefix_i32(
+                    tid, packed, scan
+                )
+                better_before = packed_before >> fx.Int32(_PACK_SHIFT)
+                equal_before = packed_before & fx.Int32(_PACK_MASK)
+                better_total = packed_total >> fx.Int32(_PACK_SHIFT)
+                equal_total = packed_total & fx.Int32(_PACK_MASK)
+                room = equal_needed - equal_seen
+                room = (room < 0).select(fx.Int32(0), room)
+                admit_equal = equal & (equal_before < room)
+                keep = better | admit_equal
+                admitted_equal_before = (equal_before < room).select(equal_before, room)
+                destination = write_cursor + better_before + admitted_equal_before
+                if keep:
+                    output_scores_row[destination] = value
+                    output_positions_row[destination] = split_begin + pool_pos
+                    if prepare_merge:
+                        bucket = radix_bucket(score_ord, 0) ^ fx.Int32(RADIX_SIGN_BIT)
+                        atomic_add_i32(histogram, 1, bucket, "workgroup")
+                admitted_equal_total = (equal_total < room).select(equal_total, room)
+                write_cursor = write_cursor + better_total + admitted_equal_total
+                equal_seen = equal_seen + equal_total
+            gpu.barrier()
+
+            if prepare_merge:
+                for hist_step in range_constexpr(
+                    (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                ):
+                    hist_bin = hist_step * BLOCK_THREADS + tid
+                    count = histogram[hist_bin]
+                    if count != 0:
+                        atomic_add_i32(
+                            merge_histogram_row,
+                            count,
+                            hist_bin,
+                            "agent",
+                        )
+                gpu.barrier()
+            if tid == 0:
+                state[state_base + _RETAINED] = fx.Int32(topk)
+
         neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
         result_type = fx.Vector.make_type(DREG, fx.Float32)
         tile_number = fx.Int32(0)
         score_keep = fx.Float32(0.0)
         for col0 in range(split_begin, split_end, fx.Int32(BLOCK_N)):
-            batch_tile = _umod(tile_number, tiles_per_compact)
-            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
+            if const_expr(full_split_select):
+                batch_tile = fx.Int32(0)
+                batch_first = split_begin
+            else:
+                batch_tile = _umod(tile_number, tiles_per_compact)
+                batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
             wave_tile_base = wave * fx.Int32(N_TILES_PER_WAVE)
             logical_tiles = []
             k_packs = []
@@ -433,9 +601,7 @@ def compile_fp8_paged_mqa_local_topk(
                     + lane_mod_16
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
-                table_offset = request * max_pages + _udiv(
-                    safe_logical, page_size_i32
-                )
+                table_offset = request * max_pages + _udiv(safe_logical, page_size_i32)
                 physical_page = fx.Int32(tables[table_offset])
                 token_in_page = _umod(safe_logical, page_size_i32)
                 physical = physical_page * page_size_i32 + token_in_page
@@ -481,11 +647,7 @@ def compile_fp8_paged_mqa_local_topk(
                             scaled = fx.Float32(frag[ii]) * scale
                             activated = scaled.maximumf(fx.Float32(0.0))
                             weight = weight_frags[row_in_group][mi][ii]
-                            total = (
-                                total
-                                + activated
-                                * weight
-                            )
+                            total = total + activated * weight
                     total = total + total.shuffle_xor(16, WAVE_SIZE)
                     total = total + total.shuffle_xor(32, WAVE_SIZE)
 
@@ -498,74 +660,222 @@ def compile_fp8_paged_mqa_local_topk(
                     )
                     destination = (
                         pool_base
-                        + state[state_base + _RETAINED]
+                        + (
+                            fx.Int32(0)
+                            if const_expr(full_split_select)
+                            else state[state_base + _RETAINED]
+                        )
                         + logical
                         - batch_first
                     )
 
                     if not const_expr(skip_candidate_writes):
-                        @flyc.jit
-                        def _write_candidate(
-                            _pred=is_writer,
-                            _dst=destination,
-                            _score=total,
-                            _logical=logical,
-                            _values=pool_values,
-                            _indices=pool_indices,
-                        ):
-                            if _pred:
-                                _values[_dst] = _score
-                                _indices[_dst] = fx.Uint16(
-                                    _logical - split_begin
-                                )
+                        if const_expr(full_split_select):
 
-                        _write_candidate()
+                            @flyc.jit
+                            def _write_full_split_score(
+                                _pred=is_writer,
+                                _dst=destination,
+                                _score=total,
+                                _values=pool_values,
+                            ):
+                                if _pred:
+                                    _values[_dst] = _score
+
+                            _write_full_split_score()
+                        else:
+
+                            @flyc.jit
+                            def _write_candidate(
+                                _pred=is_writer,
+                                _dst=destination,
+                                _score=total,
+                                _logical=logical,
+                                _values=pool_values,
+                                _indices=pool_indices,
+                            ):
+                                if _pred:
+                                    _values[_dst] = _score
+                                    _indices[_dst] = fx.Uint16(_logical - split_begin)
+
+                            _write_candidate()
                     else:
                         score_keep = score_keep + total
 
             end_of_batch = batch_tile == fx.Int32(tiles_per_compact - 1)
             final_tile = col0 + fx.Int32(BLOCK_N) >= split_end
-            if not const_expr(skip_compact):
-                if end_of_batch | final_tile:
-                    gpu.barrier()
-                    batch_end = _imin(col0 + fx.Int32(BLOCK_N), split_end)
-                    for row_in_group in range_constexpr(rows_per_cta):
-                        state_base = fx.Int32(row_in_group * _STATE_SIZE)
-                        pool_base = fx.Int32(row_in_group * pool_capacity)
-                        incoming_end = _imin(
-                            batch_end,
-                            valid_lens[row_in_group],
+            if (
+                not const_expr(skip_compact)
+                and not const_expr(full_split_select)
+                and (end_of_batch | final_tile)
+            ):
+                gpu.barrier()
+                batch_end = _imin(col0 + fx.Int32(BLOCK_N), split_end)
+                for row_in_group in range_constexpr(rows_per_cta):
+                    state_base = fx.Int32(row_in_group * _STATE_SIZE)
+                    pool_base = fx.Int32(row_in_group * pool_capacity)
+                    incoming_end = _imin(
+                        batch_end,
+                        valid_lens[row_in_group],
+                    )
+                    incoming_count = (incoming_end > batch_first).select(
+                        incoming_end - batch_first,
+                        fx.Int32(0),
+                    )
+                    pool_count = state[state_base + _RETAINED] + incoming_count
+                    if pool_count > fx.Int32(topk):
+                        _compact(
+                            pool_count,
+                            pool_base,
+                            state_base,
+                            state,
+                            histogram,
+                            scan,
+                            pool_values,
+                            pool_indices,
                         )
-                        incoming_count = (
-                            incoming_end > batch_first
-                        ).select(
-                            incoming_end - batch_first,
-                            fx.Int32(0),
-                        )
-                        pool_count = (
-                            state[state_base + _RETAINED] + incoming_count
-                        )
-                        if pool_count > fx.Int32(topk):
-                            _compact(
-                                pool_count,
-                                pool_base,
-                                state_base,
-                                state,
-                                histogram,
-                                scan,
-                                pool_values,
-                                pool_indices,
-                            )
-                        else:
-                            if tid == 0:
-                                state[state_base + _RETAINED] = pool_count
-                            gpu.barrier()
+                    else:
+                        if tid == 0:
+                            state[state_base + _RETAINED] = pool_count
+                        gpu.barrier()
             tile_number = tile_number + fx.Int32(1)
 
         if const_expr(skip_candidate_writes) and tid == 0:
             scan[0] = f32_to_ordered_i32(score_keep)
 
         if const_expr(skip_epilogue):
+            return
+
+        if const_expr(full_split_select):
+            for row_in_group in range_constexpr(rows_per_cta):
+                row = row_base + fx.Int32(row_in_group)
+                state_base = fx.Int32(row_in_group * _STATE_SIZE)
+                pool_base = fx.Int32(row_in_group * pool_capacity)
+                valid_len = valid_lens[row_in_group]
+                split_row_end = _imin(split_end, valid_len)
+                pool_count = (split_row_end > split_begin).select(
+                    split_row_end - split_begin,
+                    fx.Int32(0),
+                )
+                output_scores_row = fx.slice(
+                    candidate_scores,
+                    (row, split, None),
+                )
+                output_positions_row = fx.slice(
+                    candidate_positions,
+                    (row, split, None),
+                )
+                merge_histogram_row = fx.slice(
+                    merge_histogram,
+                    (row, 0, None),
+                )
+                merge_state_row = fx.slice(
+                    merge_state,
+                    (row, None),
+                )
+                if not const_expr(skip_compact):
+                    if pool_count > fx.Int32(topk):
+                        _full_split_select(
+                            pool_count,
+                            pool_base,
+                            state_base,
+                            state,
+                            histogram,
+                            scan,
+                            pool_values,
+                            output_scores_row,
+                            output_positions_row,
+                            merge_histogram_row,
+                            merge_state_row,
+                            valid_len,
+                        )
+                    else:
+                        if const_expr(prepare_merge):
+                            for hist_step in range_constexpr(
+                                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                            ):
+                                histogram[hist_step * BLOCK_THREADS + tid] = 0
+                            if split == 0 and tid == 0:
+                                merge_state_row[_MERGE_PREFIX] = 0
+                                merge_state_row[_MERGE_MASK] = 0
+                                merge_state_row[_MERGE_REMAINING] = _imin(
+                                    valid_len,
+                                    fx.Int32(topk),
+                                )
+                                merge_state_row[_MERGE_WRITE_COUNTER] = 0
+                                merge_state_row[_MERGE_EQ_COUNTER] = 0
+                                merge_state_row[_MERGE_DIRECT] = 0
+                            gpu.barrier()
+                        for step in range_constexpr(output_steps):
+                            slot = fx.Int32(step * BLOCK_THREADS) + tid
+                            if slot < fx.Int32(topk):
+                                live = slot < pool_count
+                                safe_slot = live.select(slot, fx.Int32(0))
+                                candidate_score = pool_values[pool_base + safe_slot]
+                                output_scores_row[slot] = live.select(
+                                    candidate_score,
+                                    fx.Float32(float("-inf")),
+                                )
+                                output_positions_row[slot] = live.select(
+                                    split_begin + slot,
+                                    fx.Int32(-1),
+                                )
+                                if const_expr(prepare_merge):
+
+                                    @flyc.jit
+                                    def _count_direct_candidate(
+                                        _pred=live,
+                                        _score=candidate_score,
+                                        _histogram=histogram,
+                                    ):
+                                        if _pred:
+                                            bucket = radix_bucket(
+                                                f32_to_ordered_i32(_score),
+                                                0,
+                                            ) ^ fx.Int32(RADIX_SIGN_BIT)
+                                            atomic_add_i32(
+                                                _histogram,
+                                                1,
+                                                bucket,
+                                                "workgroup",
+                                            )
+
+                                    _count_direct_candidate()
+                        if const_expr(prepare_merge):
+                            gpu.barrier()
+                            for hist_step in range_constexpr(
+                                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                            ):
+                                hist_bin = hist_step * BLOCK_THREADS + tid
+                                count = histogram[hist_bin]
+                                if count != 0:
+                                    atomic_add_i32(
+                                        merge_histogram_row,
+                                        count,
+                                        hist_bin,
+                                        "agent",
+                                    )
+                            gpu.barrier()
+                        if tid == 0:
+                            state[state_base + _RETAINED] = pool_count
+                        gpu.barrier()
+                else:
+                    for step in range_constexpr(output_steps):
+                        slot = fx.Int32(step * BLOCK_THREADS) + tid
+                        if slot < fx.Int32(topk):
+                            output_scores_row[slot] = fx.Float32(float("-inf"))
+                            output_positions_row[slot] = fx.Int32(-1)
+                    if tid == 0:
+                        state[state_base + _RETAINED] = 0
+                    gpu.barrier()
+                if tid == 0:
+                    fx.ptr_store(
+                        state[state_base + _RETAINED],
+                        fx.add_offset(
+                            fx.get_iter(candidate_counts),
+                            row * num_splits + split,
+                        ),
+                    )
             return
 
         for row_in_group in range_constexpr(rows_per_cta):
@@ -618,13 +928,11 @@ def compile_fp8_paged_mqa_local_topk(
                         fx.Float32(float("-inf")),
                     )
                     output_positions_row[slot] = live.select(
-                        split_begin
-                        + fx.Int32(
-                            pool_indices[pool_base + safe_slot]
-                        ),
+                        split_begin + fx.Int32(pool_indices[pool_base + safe_slot]),
                         fx.Int32(-1),
                     )
                     if const_expr(prepare_merge):
+
                         @flyc.jit
                         def _count_candidate(
                             _pred=live,
@@ -647,8 +955,7 @@ def compile_fp8_paged_mqa_local_topk(
             if const_expr(prepare_merge):
                 gpu.barrier()
                 for hist_step in range_constexpr(
-                    (NUM_HIST_BINS + BLOCK_THREADS - 1)
-                    // BLOCK_THREADS
+                    (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
                 ):
                     hist_bin = hist_step * BLOCK_THREADS + tid
                     count = histogram[hist_bin]
@@ -737,6 +1044,13 @@ def launch_fp8_paged_mqa_local_topk(
     batch, next_n, _, _ = q_fp8.shape
     rows = batch * next_n
     use_row_reuse = 2 <= next_n <= 4 and rows <= MTP_REUSE_MAX_ROWS
+    max_split_span = (block_tables.shape[1] * page_size + num_splits - 1) // num_splits
+    full_split_select = (
+        MTP2_FULL_SPLIT_SELECT
+        and use_row_reuse
+        and next_n == 2
+        and max_split_span <= FULL_SPLIT_CAPACITY
+    )
     launcher = compile_fp8_paged_mqa_local_topk(
         topk=topk,
         arch=arch,
@@ -744,6 +1058,7 @@ def launch_fp8_paged_mqa_local_topk(
         page_size=page_size,
         rows_per_cta=next_n if use_row_reuse else 1,
         prepare_merge=prepare_merge,
+        full_split_select=full_split_select,
         skip_compact=SKIP_COMPACT,
         skip_candidate_writes=SKIP_CANDIDATE_WRITES,
         skip_epilogue=SKIP_EPILOGUE,

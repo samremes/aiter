@@ -271,6 +271,90 @@ def test_preshuffled_page64_mtp_causal_local_sets(next_n, rows):
     _assert_candidates(case, *outputs, k=k, splits=splits)
 
 
+@pytest.mark.parametrize("length", [32768, 32769])
+def test_preshuffled_page64_mtp2_full_split_capacity_guard(length):
+    _require_supported_gpu()
+    rows, next_n, k, splits = 2, 2, 128, 2
+    case = _make_case(
+        rows,
+        length,
+        64,
+        seed=46,
+        next_n=next_n,
+    )
+    outputs = flydsl_fp8_paged_mqa_local_topk(
+        case.q,
+        _preshuffle_kv(case.kv),
+        case.scales,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    _assert_candidates(case, *outputs, k=k, splits=splits)
+
+
+def test_preshuffled_page64_mtp2_threshold_ties_and_nan_bottom():
+    _require_supported_gpu()
+    rows, next_n, length, k, splits = 2, 2, 4096, 128, 1
+
+    tie_case = _make_case(
+        rows,
+        length,
+        64,
+        seed=48,
+        next_n=next_n,
+    )
+    tie_case.weights.zero_()
+    tie_scores, tie_positions, tie_counts = flydsl_fp8_paged_mqa_local_topk(
+        tie_case.q,
+        _preshuffle_kv(tie_case.kv),
+        tie_case.scales,
+        tie_case.weights,
+        tie_case.lengths,
+        tie_case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    assert torch.equal(tie_counts, torch.full_like(tie_counts, k))
+    assert torch.equal(tie_scores, torch.zeros_like(tie_scores))
+    for row in range(rows):
+        assert tie_positions[row, 0].unique().numel() == k
+
+    nan_case = _make_case(
+        rows,
+        length,
+        64,
+        seed=49,
+        next_n=next_n,
+    )
+    nan_case.scales.reshape(-1)[1::2] = float("nan")
+    nan_scores, nan_positions, _ = flydsl_fp8_paged_mqa_local_topk(
+        nan_case.q,
+        _preshuffle_kv(nan_case.kv),
+        nan_case.scales,
+        nan_case.weights,
+        nan_case.lengths,
+        nan_case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    reference = run_torch(nan_case)
+    for row in range(rows):
+        expected = torch.topk(
+            torch.nan_to_num(reference[row], nan=-float("inf")),
+            k,
+            sorted=False,
+        ).indices
+        got = nan_positions[row, 0].long()
+        assert set(got.cpu().tolist()) == set(expected.cpu().tolist())
+        assert not torch.isnan(nan_scores[row, 0]).any()
+
+
 def test_preshuffled_page64_mtp_flat_row_fallback():
     _require_supported_gpu()
     rows, next_n, length, k, splits = 16, 2, 4097, 128, 4
@@ -402,9 +486,7 @@ def test_split_topk_merge_counts_nan_and_graph_replay():
     scores = torch.full(
         (rows, splits, k), float("inf"), dtype=torch.float32, device="cuda"
     )
-    positions = torch.full(
-        (rows, splits, k), -1, dtype=torch.int32, device="cuda"
-    )
+    positions = torch.full((rows, splits, k), -1, dtype=torch.int32, device="cuda")
     generator = torch.Generator(device="cuda").manual_seed(59)
     for row in range(rows):
         position = 0
@@ -449,9 +531,7 @@ def test_split_topk_merge_counts_nan_and_graph_replay():
     for row in range(rows):
         for split in range(splits):
             tie_scores[row, split, : int(counts[row, split])] = 0
-    tie_values, tie_positions = split_topk_merge(
-        tie_scores, positions, counts, k=k
-    )
+    tie_values, tie_positions = split_topk_merge(tie_scores, positions, counts, k=k)
     assert torch.equal(tie_values, torch.zeros_like(tie_values))
     for row in range(rows):
         chosen = tie_positions[row].cpu().tolist()
