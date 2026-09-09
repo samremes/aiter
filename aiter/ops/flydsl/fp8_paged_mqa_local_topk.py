@@ -13,6 +13,8 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     NUM_XCD,
     SUPPORTED_K,
     WORKGROUPS_PER_CU,
+    HEAD_DIM,
+    INDEX_DIM,
     launch_fp8_paged_mqa_local_topk,
 )
 from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
@@ -44,6 +46,48 @@ def _require_cuda_contiguous(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(f"{name} must be on a CUDA/HIP device")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _packed_page_shape(kv_cache: torch.Tensor) -> tuple[int, int] | None:
+    if kv_cache.ndim == 4 and kv_cache.shape[2:] == (1, INDEX_DIM):
+        return int(kv_cache.shape[0]), int(kv_cache.shape[1])
+    if kv_cache.ndim == 3 and kv_cache.shape[-1] == INDEX_DIM:
+        return int(kv_cache.shape[0]), int(kv_cache.shape[1])
+    return None
+
+
+def _packed_scale_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    return kv_cache.view(torch.float32).reshape(-1)
+
+
+def _normalize_kv_inputs(kv_cache, k_scales, q_dtype):
+    packed_shape = _packed_page_shape(kv_cache)
+    if packed_shape is not None:
+        num_pages, page_size = packed_shape
+        if kv_cache.dtype not in (q_dtype, torch.uint8):
+            raise ValueError(
+                "packed kv_cache must be uint8 or the query fp8 dtype, "
+                f"got {kv_cache.dtype}"
+            )
+        return kv_cache, _packed_scale_view(kv_cache), True, num_pages, page_size
+    if kv_cache.ndim != 3 or kv_cache.shape[2] != HEAD_DIM:
+        raise ValueError(
+            "kv_cache must have shape [num_pages,page_size,128] or packed "
+            f"[num_pages,page_size,1,{INDEX_DIM}], got {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.dtype != q_dtype:
+        raise ValueError(
+            f"kv_cache dtype must match q_fp8 ({q_dtype}), got {kv_cache.dtype}"
+        )
+    num_pages, page_size, _ = kv_cache.shape
+    if k_scales is None:
+        raise ValueError("k_scales is required for split (non-packed) kv_cache")
+    if k_scales.shape != (num_pages, page_size) or k_scales.dtype != torch.float32:
+        raise ValueError(
+            "k_scales must be contiguous float32 with shape "
+            f"{(num_pages, page_size)}, got {tuple(k_scales.shape)} {k_scales.dtype}"
+        )
+    return kv_cache, k_scales, False, num_pages, page_size
 
 
 def _normalize_context_lens(
@@ -119,14 +163,19 @@ def flydsl_fp8_paged_mqa_local_topk(
     for name, tensor in (
         ("q_fp8", q_fp8),
         ("kv_cache", kv_cache),
-        ("k_scales", k_scales),
         ("weights", weights),
         ("context_lens", context_lens),
         ("block_tables", block_tables),
     ):
         _require_cuda_contiguous(name, tensor)
+    packed_shape = _packed_page_shape(kv_cache)
+    if packed_shape is None:
+        _require_cuda_contiguous("k_scales", k_scales)
 
     device = q_fp8.device
+    kv_cache, k_scales, packed, num_pages, page_size = _normalize_kv_inputs(
+        kv_cache, k_scales, q_fp8.dtype
+    )
     tensors = (kv_cache, k_scales, weights, context_lens, block_tables)
     if any(t.device != device for t in tensors):
         raise ValueError("all inputs must be on the same device")
@@ -145,26 +194,11 @@ def flydsl_fp8_paged_mqa_local_topk(
         raise ValueError(
             f"gfx950 requires torch.float8_e4m3fn q_fp8, got {q_fp8.dtype}"
         )
-    if kv_cache.ndim != 3 or kv_cache.shape[2] != 128:
-        raise ValueError(
-            "kv_cache must have shape [num_pages,page_size,128], "
-            f"got {tuple(kv_cache.shape)}"
-        )
-    if kv_cache.dtype != q_fp8.dtype:
-        raise ValueError(
-            f"kv_cache dtype must match q_fp8 ({q_fp8.dtype}), got {kv_cache.dtype}"
-        )
     if not isinstance(preshuffled, bool):
         raise TypeError(f"preshuffled must be bool, got {type(preshuffled).__name__}")
 
     batch, next_n, _, _ = q_fp8.shape
     rows = batch * next_n
-    num_pages, page_size, _ = kv_cache.shape
-    if k_scales.shape != (num_pages, page_size) or k_scales.dtype != torch.float32:
-        raise ValueError(
-            "k_scales must be contiguous float32 with shape "
-            f"{(num_pages, page_size)}, got {tuple(k_scales.shape)} {k_scales.dtype}"
-        )
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
         raise ValueError(
             f"weights must be contiguous float32 with shape {(rows, 32)}, "
@@ -226,6 +260,7 @@ def flydsl_fp8_paged_mqa_local_topk(
             preshuffled=preshuffled,
             arch=arch,
             stream=stream,
+            packed=packed,
         )
     return candidate_scores, candidate_positions, candidate_counts
 
@@ -245,14 +280,19 @@ def flydsl_fp8_paged_mqa_topk(
     for name, tensor in (
         ("q_fp8", q_fp8),
         ("kv_cache", kv_cache),
-        ("k_scales", k_scales),
         ("weights", weights),
         ("context_lens", context_lens),
         ("block_tables", block_tables),
     ):
         _require_cuda_contiguous(name, tensor)
+    packed_shape = _packed_page_shape(kv_cache)
+    if packed_shape is None:
+        _require_cuda_contiguous("k_scales", k_scales)
 
     device = q_fp8.device
+    kv_cache, k_scales, packed, num_pages, page_size = _normalize_kv_inputs(
+        kv_cache, k_scales, q_fp8.dtype
+    )
     if any(
         tensor.device != device
         for tensor in (
@@ -279,15 +319,11 @@ def flydsl_fp8_paged_mqa_topk(
     rows = batch * next_n
     if q_fp8.dtype != torch.float8_e4m3fn:
         raise ValueError(f"q_fp8 must be float8_e4m3fn, got {q_fp8.dtype}")
-    if kv_cache.ndim != 3 or kv_cache.shape[1:] != (64, 128):
+    if page_size != 64:
         raise ValueError(
-            "this specialization requires preshuffled kv_cache shape "
-            f"[pages,64,128], got {tuple(kv_cache.shape)}"
+            "this specialization requires page_size 64, "
+            f"got {page_size}"
         )
-    if kv_cache.dtype != q_fp8.dtype:
-        raise ValueError("kv_cache dtype must match q_fp8")
-    if k_scales.shape != kv_cache.shape[:2] or k_scales.dtype != torch.float32:
-        raise ValueError("k_scales must be float32 [pages,64]")
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
         raise ValueError(f"weights must be float32 with shape {(rows, 32)}")
     if context_lens.dtype != torch.int32:
@@ -355,6 +391,7 @@ def flydsl_fp8_paged_mqa_topk(
             prepare_merge=workspace is not None,
             merge_histogram=workspace[0] if workspace is not None else None,
             merge_state=workspace[1] if workspace is not None else None,
+            packed=packed,
         )
         if workspace is None:
             values = candidate_scores[:, 0]

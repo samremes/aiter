@@ -27,6 +27,7 @@ from ..tensor_shim import GTensor, _run_compiled, _to_raw
 
 HEADS = 32
 HEAD_DIM = 128
+INDEX_DIM = HEAD_DIM + 4
 PROFILE_WAVES = 8
 BLOCK_THREADS = PROFILE_WAVES * WAVE_SIZE
 BLOCK_N = PROFILE_WAVES * 32
@@ -122,6 +123,7 @@ def compile_fp8_paged_mqa_local_topk(
     preshuffled: bool,
     page_size: int,
     prepare_merge: bool = False,
+    packed: bool = False,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -142,18 +144,22 @@ def compile_fp8_paged_mqa_local_topk(
     )
     block_exclusive_prefix_i32 = make_block_exclusive_prefix_i32(WAVES)
     layout_name = "preshuffled" if preshuffled else "rowmajor"
+    packed_tag = "_packed" if packed else ""
     kernel_name = (
-        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}_"
+        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
         f"pm{int(prepare_merge)}_xcdswap_{arch}"
     )
+    page_index_dim = INDEX_DIM if packed else HEAD_DIM
+    block_i32 = page_size * page_index_dim // 4
+    scale_i32 = page_size * HEAD_DIM // 4
 
     if preshuffled:
 
         def _load_k(kv_i32, physical_page, token_in_page, physical, page_size, lane):
             return _load_preshuffled_fp8x32(
                 kv_i32,
-                physical_page * page_size * fx.Int32(HEAD_DIM),
+                physical_page * page_size * fx.Int32(page_index_dim),
                 token_in_page,
                 lane,
             )
@@ -161,11 +167,27 @@ def compile_fp8_paged_mqa_local_topk(
     else:
 
         def _load_k(kv_i32, physical_page, token_in_page, physical, page_size, lane):
-            return _load_fp8x32(
-                kv_i32,
-                physical * fx.Int32(HEAD_DIM),
-                lane,
+            byte_base = (
+                physical_page * page_size * fx.Int32(page_index_dim)
+                + token_in_page * fx.Int32(HEAD_DIM)
             )
+            return _load_fp8x32(kv_i32, byte_base, lane)
+
+    if packed:
+
+        def _load_scale(scales, physical_page, token_in_page, physical):
+            return fx.Float32(
+                scales[
+                    physical_page * fx.Int32(block_i32)
+                    + fx.Int32(scale_i32)
+                    + token_in_page
+                ]
+            )
+
+    else:
+
+        def _load_scale(scales, physical_page, token_in_page, physical):
+            return fx.Float32(scales[physical])
 
     @flyc.kernel(name=kernel_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -379,7 +401,7 @@ def compile_fp8_paged_mqa_local_topk(
                     page_size_i32,
                     lane_div_16,
                 )
-                scale = fx.Float32(scales[physical])
+                scale = _load_scale(scales, physical_page, token_in_page, physical)
                 logical_tiles.append(logical)
                 k_packs.append(k_pack)
                 scale_tiles.append(scale)
@@ -678,6 +700,7 @@ def launch_fp8_paged_mqa_local_topk(
     prepare_merge=False,
     merge_histogram=None,
     merge_state=None,
+    packed=False,
 ):
     page_size = kv_cache.shape[1]
     batch, next_n, _, _ = q_fp8.shape
@@ -688,6 +711,7 @@ def launch_fp8_paged_mqa_local_topk(
         preshuffled=preshuffled,
         page_size=page_size,
         prepare_merge=prepare_merge,
+        packed=packed,
     )
     max_pages = block_tables.shape[1]
     if merge_histogram is None:

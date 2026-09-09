@@ -118,6 +118,18 @@ def _preshuffle_kv(kv):
     return shuffle_weight(kv, layout=(16, 16)).contiguous()
 
 
+def _pack_kv(kv, scales):
+    pages, page_size, dim = kv.shape
+    raw = torch.empty(
+        (pages, page_size * (dim + 4)),
+        dtype=torch.uint8,
+        device=kv.device,
+    )
+    raw[:, : page_size * dim] = kv.view(torch.uint8).reshape(pages, -1)
+    raw[:, page_size * dim :] = scales.view(torch.uint8).reshape(pages, -1)
+    return raw.view(pages, page_size, 1, dim + 4)
+
+
 def run_torch(case):
     """Independent FP32 oracle with explicit page mapping and epilogue order."""
     batch, next_n = case.q.shape[:2]
@@ -244,6 +256,40 @@ def test_preshuffled_page64_local_sets():
         preshuffled=True,
     )
     _assert_candidates(case, *outputs, k=k, splits=splits)
+
+
+def test_preshuffled_page64_packed_matches_split():
+    _require_supported_gpu()
+    rows, length, k, splits = 2, 8193, 128, 4
+    case = _make_case(rows, length, 64, seed=41)
+    shuffled = _preshuffle_kv(case.kv)
+    split_out = flydsl_fp8_paged_mqa_local_topk(
+        case.q,
+        shuffled,
+        case.scales,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    packed_out = flydsl_fp8_paged_mqa_local_topk(
+        case.q,
+        _pack_kv(shuffled, case.scales),
+        case.scales,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    _assert_candidates(case, *split_out, k=k, splits=splits)
+    _assert_candidates(case, *packed_out, k=k, splits=splits)
+    torch.testing.assert_close(packed_out[0], split_out[0], rtol=0, atol=0)
+    torch.testing.assert_close(packed_out[1], split_out[1], rtol=0, atol=0)
+    torch.testing.assert_close(packed_out[2], split_out[2], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
