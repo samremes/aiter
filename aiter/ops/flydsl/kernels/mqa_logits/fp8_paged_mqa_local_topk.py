@@ -59,6 +59,24 @@ if MTP_REUSE_MAX_ROWS <= 0:
     raise ValueError("AITER_STAGE_A_MTP_REUSE_MAX_ROWS must be positive")
 
 
+def grouped_rows_per_cta(next_n: int, rows: int) -> int:
+    """Launch even ``next_n`` as consecutive two-row CTAs when the grid is small.
+
+    Pairs stay inside one request because ``next_n`` is even. Above
+    ``MTP_REUSE_MAX_ROWS`` one-row CTAs are faster: the two-row full-split
+    reservoir needs 64 splits at L=1M, which oversubscribes, and streaming
+    two-row compact is slower than the one-row path.
+    """
+    if (
+        next_n >= 2
+        and next_n % 2 == 0
+        and rows % 2 == 0
+        and rows <= MTP_REUSE_MAX_ROWS
+    ):
+        return 2
+    return 1
+
+
 def _env_flag(name: str, *, default: bool = False) -> bool:
     fallback = "1" if default else "0"
     return os.environ.get(name, fallback) in ("1", "true", "True", "yes", "YES")
@@ -73,6 +91,14 @@ SKIP_EPILOGUE = _env_flag("AITER_STAGE_A_SKIP_EPILOGUE")
 MTP2_FULL_SPLIT_SELECT = _env_flag(
     "AITER_STAGE_A_MTP2_FULL_SPLIT_SELECT", default=True
 )
+# 0 identity, 1 swap grid axes, 2 HipKittens Alg1 C=2, 3 Alg1 C=4,
+# 4 pack each split's row-groups onto one assumed XCD (id%8).
+# Map 1 is the measured default: same-split CTAs share an XCD when
+# num_splits % 8 == 0.
+XCD_MAP = int(os.environ.get("AITER_STAGE_A_XCD_MAP", "1"))
+if XCD_MAP not in (0, 1, 2, 3, 4):
+    raise ValueError("AITER_STAGE_A_XCD_MAP must be 0..4")
+NUM_XCD = 8
 WORKGROUPS_PER_CU = 16 // PROFILE_WAVES
 SUPPORTED_K = (128, 512, 1024, 2048)
 FULL_SPLIT_CAPACITY = 16384
@@ -161,6 +187,18 @@ def _load_preshuffled_fp8x32(
     return _concat_i32x4(lo, hi)
 
 
+def _alg1_xy2(flat, chunk):
+    xcd = _umod(flat, NUM_XCD)
+    local = _udiv(flat, NUM_XCD)
+    chunk_idx = _udiv(local, chunk)
+    pos = _umod(local, chunk)
+    return (
+        chunk_idx * fx.Int32(NUM_XCD * chunk)
+        + xcd * fx.Int32(chunk)
+        + pos
+    )
+
+
 @lru_cache(maxsize=32)
 def compile_fp8_paged_mqa_local_topk(
     *,
@@ -174,6 +212,7 @@ def compile_fp8_paged_mqa_local_topk(
     skip_compact: bool = False,
     skip_candidate_writes: bool = False,
     skip_epilogue: bool = False,
+    xcd_map: int = 0,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -182,6 +221,8 @@ def compile_fp8_paged_mqa_local_topk(
         raise ValueError(f"rows_per_cta must be in [1,4], got {rows_per_cta}")
     if full_split_select and rows_per_cta != 2:
         raise ValueError("full_split_select requires rows_per_cta=2")
+    if xcd_map not in (0, 1, 2, 3, 4):
+        raise ValueError(f"xcd_map must be 0..4, got {xcd_map}")
     if arch != "gfx950":
         raise RuntimeError(
             "the initial native-e4m3fn Stage-A specialization supports gfx950 only"
@@ -217,7 +258,8 @@ def compile_fp8_paged_mqa_local_topk(
         f"w{WAVES}_bn{BLOCK_N}_r{rows_per_cta}_inc{incoming_capacity}_"
         f"{f'fs{int(full_split_select)}_' if rows_per_cta == 2 else ''}"
         f"pm{int(prepare_merge)}_sc{int(skip_compact)}_"
-        f"sw{int(skip_candidate_writes)}_se{int(skip_epilogue)}_{arch}"
+        f"sw{int(skip_candidate_writes)}_se{int(skip_epilogue)}_"
+        f"xcd{int(xcd_map)}_{arch}"
     )
 
     if preshuffled:
@@ -259,9 +301,33 @@ def compile_fp8_paged_mqa_local_topk(
     ):
         page_size_i32 = fx.Int32(page_size)
         tid = fx.Int32(gpu.thread_idx.x)
-        row_group = fx.Int32(gpu.block_idx.x)
+        bx = fx.Int32(gpu.block_idx.x)
+        by = fx.Int32(gpu.block_idx.y)
+        row_groups = _udiv(rows, fx.Int32(rows_per_cta))
+        row_group = bx
+        split = by
+        if const_expr(xcd_map == 1):
+            row_group = by
+            split = bx
+        elif const_expr(xcd_map == 2) or const_expr(xcd_map == 3):
+            flat = bx + row_groups * by
+            total = row_groups * num_splits
+            chunk = 2 if xcd_map == 2 else 4
+            stride = fx.Int32(NUM_XCD * chunk)
+            can_alg1 = _umod(total, stride) == fx.Int32(0)
+            xy2 = _alg1_xy2(flat, chunk)
+            row_group = can_alg1.select(_umod(xy2, row_groups), bx)
+            split = can_alg1.select(_udiv(xy2, row_groups), by)
+        elif const_expr(xcd_map == 4):
+            flat = bx + row_groups * by
+            can_pack = _umod(num_splits, fx.Int32(NUM_XCD)) == fx.Int32(0)
+            xcd = _umod(flat, NUM_XCD)
+            local = _udiv(flat, NUM_XCD)
+            packed_row = _umod(local, row_groups)
+            packed_split = xcd + _udiv(local, row_groups) * fx.Int32(NUM_XCD)
+            row_group = can_pack.select(packed_row, bx)
+            split = can_pack.select(packed_split, by)
         row_base = row_group * fx.Int32(rows_per_cta)
-        split = fx.Int32(gpu.block_idx.y)
         wave = _udiv(tid, WAVE_SIZE)
         lane = _umod(tid, WAVE_SIZE)
         lane_div_16 = _udiv(lane, MFMA_N)
@@ -996,8 +1062,12 @@ def compile_fp8_paged_mqa_local_topk(
         stream: fx.Stream,
     ):
         row_groups = _udiv(rows, fx.Int32(rows_per_cta))
-        gx = arith.index_cast(T.index, _to_raw(row_groups))
-        gy = arith.index_cast(T.index, _to_raw(num_splits))
+        if const_expr(xcd_map == 1):
+            gx = arith.index_cast(T.index, _to_raw(num_splits))
+            gy = arith.index_cast(T.index, _to_raw(row_groups))
+        else:
+            gx = arith.index_cast(T.index, _to_raw(row_groups))
+            gy = arith.index_cast(T.index, _to_raw(num_splits))
         kernel(
             q_fp8,
             kv_cache,
@@ -1043,12 +1113,11 @@ def launch_fp8_paged_mqa_local_topk(
     page_size = kv_cache.shape[1]
     batch, next_n, _, _ = q_fp8.shape
     rows = batch * next_n
-    use_row_reuse = 2 <= next_n <= 4 and rows <= MTP_REUSE_MAX_ROWS
+    rows_per_cta = grouped_rows_per_cta(next_n, rows)
     max_split_span = (block_tables.shape[1] * page_size + num_splits - 1) // num_splits
     full_split_select = (
         MTP2_FULL_SPLIT_SELECT
-        and use_row_reuse
-        and next_n == 2
+        and rows_per_cta == 2
         and max_split_span <= FULL_SPLIT_CAPACITY
     )
     launcher = compile_fp8_paged_mqa_local_topk(
@@ -1056,12 +1125,13 @@ def launch_fp8_paged_mqa_local_topk(
         arch=arch,
         preshuffled=preshuffled,
         page_size=page_size,
-        rows_per_cta=next_n if use_row_reuse else 1,
+        rows_per_cta=rows_per_cta,
         prepare_merge=prepare_merge,
         full_split_select=full_split_select,
         skip_compact=SKIP_COMPACT,
         skip_candidate_writes=SKIP_CANDIDATE_WRITES,
         skip_epilogue=SKIP_EPILOGUE,
+        xcd_map=XCD_MAP,
     )
     max_pages = block_tables.shape[1]
     if merge_histogram is None:

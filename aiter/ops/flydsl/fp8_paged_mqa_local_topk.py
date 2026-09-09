@@ -10,9 +10,10 @@ import torch
 from aiter.ops.topk import top_k_per_row_decode
 
 from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
-    MTP_REUSE_MAX_ROWS,
+    NUM_XCD,
     SUPPORTED_K,
     WORKGROUPS_PER_CU,
+    grouped_rows_per_cta,
     launch_fp8_paged_mqa_local_topk,
 )
 from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
@@ -67,16 +68,15 @@ def _normalize_context_lens(
     )
 
 
+_MAX_AUTO_SPLIT_SPAN = 32768
+
+
 def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
     rows = q_fp8.shape[0] * q_fp8.shape[1]
     next_n = q_fp8.shape[1]
     cu_count = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
-    rows_per_cta = (
-        next_n
-        if 2 <= next_n <= 4 and rows <= MTP_REUSE_MAX_ROWS
-        else 1
-    )
-    row_groups = rows // rows_per_cta
+    rows_per_cta = grouped_rows_per_cta(next_n, rows)
+    row_groups = max(1, rows // rows_per_cta)
     workgroups_per_cu = WORKGROUPS_PER_CU if rows_per_cta == 1 else 1
     target_blocks = workgroups_per_cu * cu_count
     occupancy_splits = max(
@@ -84,7 +84,14 @@ def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
         (target_blocks + row_groups - 1) // row_groups,
     )
     useful_splits = max(1, (max_history + k - 1) // k)
-    return min(128, occupancy_splits, useful_splits)
+    splits = min(128, occupancy_splits, useful_splits)
+    while splits < 128:
+        span = (max_history + splits - 1) // splits
+        if span <= _MAX_AUTO_SPLIT_SPAN:
+            break
+        splits += 1
+    aligned = min(128, (splits + NUM_XCD - 1) // NUM_XCD * NUM_XCD)
+    return max(1, aligned)
 
 
 def flydsl_fp8_paged_mqa_local_topk(
@@ -260,10 +267,10 @@ def flydsl_fp8_paged_mqa_topk(
             f"got {tuple(q_fp8.shape)}"
         )
     batch, next_n, heads, head_dim = q_fp8.shape
-    if next_n not in (1, 2, 3, 4) or (heads, head_dim) != (32, 128):
+    if next_n < 1 or (heads, head_dim) != (32, 128):
         raise ValueError(
             "this specialization requires q_fp8 shape [B,next_n,32,128] "
-            "with next_n in [1,4], "
+            "with next_n >= 1, "
             f"got {tuple(q_fp8.shape)}"
         )
     rows = batch * next_n

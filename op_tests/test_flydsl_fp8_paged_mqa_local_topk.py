@@ -20,6 +20,9 @@ from aiter.ops.flydsl import (
     flydsl_fp8_paged_mqa_topk,
 )
 from aiter.ops.flydsl.fp8_paged_mqa_local_topk import merge_local_topk_candidates
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_local_topk import (
+    grouped_rows_per_cta,
+)
 from aiter.ops.flydsl.split_topk_merge import split_topk_merge
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -143,19 +146,30 @@ def run_torch(case):
 def _assert_candidates(case, scores, positions, counts, *, k, splits):
     reference = run_torch(case)
     all_global = []
+    next_n = case.q.shape[1]
+    rows = case.q.shape[0] * next_n
+    rows_per_cta = grouped_rows_per_cta(next_n, rows)
+    flat_lengths = case.lengths.reshape(-1)
     for row, row_scores in enumerate(reference):
         length = row_scores.numel()
         union = set()
+        row_base = (row // rows_per_cta) * rows_per_cta
+        group_len = max(
+            int(flat_lengths[row_base + row_in_group])
+            for row_in_group in range(rows_per_cta)
+        )
         for split in range(splits):
-            begin = length * split // splits
-            end = length * (split + 1) // splits
-            count = min(k, end - begin)
+            begin = group_len * split // splits
+            end = group_len * (split + 1) // splits
+            row_end = min(end, length)
+            span = max(0, row_end - begin)
+            count = min(k, span)
             assert int(counts[row, split]) == count
             got_positions = positions[row, split, :count].long()
             assert got_positions.unique().numel() == count
-            assert torch.all((got_positions >= begin) & (got_positions < end))
+            assert torch.all((got_positions >= begin) & (got_positions < row_end))
             if count:
-                local_scores = row_scores[begin:end]
+                local_scores = row_scores[begin:row_end]
                 if local_scores.numel() > k:
                     ordered = torch.sort(local_scores, descending=True).values
                     assert ordered[k - 1] > ordered[k]
@@ -245,7 +259,7 @@ def test_preshuffled_page64_local_sets():
 
 @pytest.mark.parametrize(
     "next_n,rows",
-    [(2, 8), (3, 6), (4, 8)],
+    [(2, 8), (3, 6), (4, 8), (8, 8), (2, 16), (2, 32)],
 )
 def test_preshuffled_page64_mtp_causal_local_sets(next_n, rows):
     _require_supported_gpu()
@@ -271,10 +285,14 @@ def test_preshuffled_page64_mtp_causal_local_sets(next_n, rows):
     _assert_candidates(case, *outputs, k=k, splits=splits)
 
 
+@pytest.mark.parametrize(
+    "next_n,rows",
+    [(2, 2), (4, 4), (8, 8)],
+)
 @pytest.mark.parametrize("length", [32768, 32769])
-def test_preshuffled_page64_mtp2_full_split_capacity_guard(length):
+def test_preshuffled_page64_mtp2_full_split_capacity_guard(next_n, rows, length):
     _require_supported_gpu()
-    rows, next_n, k, splits = 2, 2, 128, 2
+    k, splits = 128, 2
     case = _make_case(
         rows,
         length,
@@ -379,7 +397,7 @@ def test_preshuffled_page64_mtp_flat_row_fallback():
     _assert_candidates(case, *outputs, k=k, splits=splits)
 
 
-@pytest.mark.parametrize("next_n", [2, 3, 4])
+@pytest.mark.parametrize("next_n", [2, 3, 4, 8])
 def test_preshuffled_page64_mtp_compact_topk(next_n):
     _require_supported_gpu()
     rows, length, k, splits = next_n * 2, 8193, 128, 4
