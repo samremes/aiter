@@ -29,6 +29,8 @@ _DPP_ROW_SHR_1 = 0x111
 _DPP_ROW_SHR_2 = 0x112
 _DPP_ROW_SHR_4 = 0x114
 _DPP_ROW_SHR_8 = 0x118
+_DPP_ROW_BCAST_15 = 0x142
+_DPP_ROW_BCAST_31 = 0x143
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
@@ -116,12 +118,26 @@ def warp_inclusive_prefix_i32(value, lane):
         )
         value_raw = _unwrap(value)
 
-    src16 = (lane & fx.Int32(0x30)) - fx.Int32(1)
-    remote16 = fly_rocdl.ds_bpermute(T.i32, src16 * fx.Int32(4), value)
-    value = (lane >= fx.Int32(16)).select(value + fx.Int32(remote16), value)
-    src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-    remote32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), value)
-    return (lane >= fx.Int32(32)).select(value + fx.Int32(remote32), value)
+    remote16 = fly_rocdl.update_dpp(
+        T.i32,
+        zero_raw,
+        value_raw,
+        _DPP_ROW_BCAST_15,
+        0xA,
+        _DPP_BANK_MASK,
+        False,
+    )
+    value = value + fx.Int32(remote16)
+    remote32 = fly_rocdl.update_dpp(
+        T.i32,
+        zero_raw,
+        _unwrap(value),
+        _DPP_ROW_BCAST_31,
+        0xC,
+        _DPP_BANK_MASK,
+        False,
+    )
+    return value + fx.Int32(remote32)
 
 
 def make_block_exclusive_prefix_i32(num_waves):

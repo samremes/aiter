@@ -341,10 +341,22 @@ def compile_fp8_paged_mqa_local_topk(
 
         neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
         result_type = fx.Vector.make_type(DREG, fx.Float32)
-        tile_number = fx.Int32(0)
-        for col0 in range(split_begin, split_end, fx.Int32(BLOCK_N)):
-            batch_tile = _umod(tile_number, TILES_PER_COMPACT)
-            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
+
+        def _load_pages(col0):
+            wave_tile_base = wave * fx.Int32(N_TILES_PER_WAVE)
+            pages = []
+            for ni in range_constexpr(N_TILES_PER_WAVE):
+                logical = (
+                    col0
+                    + (wave_tile_base + fx.Int32(ni)) * fx.Int32(MFMA_N)
+                    + lane_mod_16
+                )
+                safe_logical = _imin(logical, split_end - fx.Int32(1))
+                table_offset = request * max_pages + _udiv(safe_logical, page_size_i32)
+                pages.append(fx.Int32(tables[table_offset]))
+            return pages
+
+        def _load_chunk(col0, pages):
             wave_tile_base = wave * fx.Int32(N_TILES_PER_WAVE)
             logical_tiles = []
             k_packs = []
@@ -356,8 +368,7 @@ def compile_fp8_paged_mqa_local_topk(
                     + lane_mod_16
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
-                table_offset = request * max_pages + _udiv(safe_logical, page_size_i32)
-                physical_page = fx.Int32(tables[table_offset])
+                physical_page = pages[ni]
                 token_in_page = _umod(safe_logical, page_size_i32)
                 physical = physical_page * page_size_i32 + token_in_page
                 k_pack = _load_k(
@@ -372,7 +383,22 @@ def compile_fp8_paged_mqa_local_topk(
                 logical_tiles.append(logical)
                 k_packs.append(k_pack)
                 scale_tiles.append(scale)
+            return logical_tiles, k_packs, scale_tiles
 
+        @flyc.jit
+        def _write_candidate(
+            _pred,
+            _dst,
+            _score,
+            _relative,
+            _values=pool_values,
+            _indices=pool_indices,
+        ):
+            if _pred:
+                _values[_dst] = _score
+                _indices[_dst] = fx.Uint16(_relative)
+
+        def _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles):
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 logical = logical_tiles[ni]
                 k_pack = k_packs[ni]
@@ -407,26 +433,55 @@ def compile_fp8_paged_mqa_local_topk(
                 is_writer = (lane_div_16 == 0) & (logical < split_end)
                 destination = state[_RETAINED] + logical - batch_first
 
-                @flyc.jit
-                def _write_candidate(
-                    _pred=is_writer,
-                    _dst=destination,
-                    _score=total,
-                    _logical=logical,
-                    _values=pool_values,
-                    _indices=pool_indices,
-                ):
-                    if _pred:
-                        _values[_dst] = _score
-                        _indices[_dst] = fx.Uint16(_logical - split_begin)
+                _write_candidate(
+                    is_writer,
+                    destination,
+                    total,
+                    logical - split_begin,
+                )
 
-                _write_candidate()
+        # Keep the second tile's paged loads in flight during the first tile's score path.
+        tiles_per_group = 2
+        assert TILES_PER_COMPACT % tiles_per_group == 0
+        group_n = fx.Int32(tiles_per_group * BLOCK_N)
+        num_tiles = _udiv(
+            split_end - split_begin + fx.Int32(BLOCK_N - 1),
+            fx.Int32(BLOCK_N),
+        )
+        paired_tiles = _udiv(num_tiles, fx.Int32(tiles_per_group)) * fx.Int32(
+            tiles_per_group
+        )
+        paired_end = _imin(
+            split_begin + paired_tiles * fx.Int32(BLOCK_N),
+            split_end,
+        )
+        tile_number = fx.Int32(0)
+        for col0 in range(split_begin, paired_end, group_n):
+            batch_tile = _umod(tile_number, TILES_PER_COMPACT)
+            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
+            pages = _load_pages(col0)
+            next_pages = _load_pages(col0 + fx.Int32(BLOCK_N))
+            logical_tiles, k_packs, scale_tiles = _load_chunk(col0, pages)
+            next_logical_tiles, next_k_packs, next_scale_tiles = _load_chunk(
+                col0 + fx.Int32(BLOCK_N),
+                next_pages,
+            )
+            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles)
+            _score_chunk(
+                batch_first,
+                next_logical_tiles,
+                next_k_packs,
+                next_scale_tiles,
+            )
 
-            end_of_batch = batch_tile == fx.Int32(TILES_PER_COMPACT - 1)
-            final_tile = col0 + fx.Int32(BLOCK_N) >= split_end
+            end_of_batch = (
+                batch_tile + fx.Int32(tiles_per_group)
+                >= fx.Int32(TILES_PER_COMPACT)
+            )
+            final_tile = col0 + group_n >= split_end
             if end_of_batch | final_tile:
                 gpu.barrier()
-                batch_end = _imin(col0 + fx.Int32(BLOCK_N), split_end)
+                batch_end = _imin(col0 + group_n, split_end)
                 incoming_count = batch_end - batch_first
                 pool_count = state[_RETAINED] + incoming_count
                 if pool_count > fx.Int32(topk):
@@ -442,6 +497,31 @@ def compile_fp8_paged_mqa_local_topk(
                     if tid == 0:
                         state[_RETAINED] = pool_count
                     gpu.barrier()
+            tile_number = tile_number + fx.Int32(tiles_per_group)
+
+        for col0 in range(paired_end, split_end, fx.Int32(BLOCK_N)):
+            batch_tile = _umod(tile_number, TILES_PER_COMPACT)
+            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
+            pages = _load_pages(col0)
+            logical_tiles, k_packs, scale_tiles = _load_chunk(col0, pages)
+            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles)
+
+            gpu.barrier()
+            incoming_count = split_end - batch_first
+            pool_count = state[_RETAINED] + incoming_count
+            if pool_count > fx.Int32(topk):
+                _compact(
+                    pool_count,
+                    state,
+                    histogram,
+                    scan,
+                    pool_values,
+                    pool_indices,
+                )
+            else:
+                if tid == 0:
+                    state[_RETAINED] = pool_count
+                gpu.barrier()
             tile_number = tile_number + fx.Int32(1)
 
         retained = state[_RETAINED]
