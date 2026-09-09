@@ -93,25 +93,26 @@ def _load_fp8x32(i32_view, byte_base, lane_div_16):
 
 def _load_preshuffled_fp8x32(
     i32_view,
-    page_base,
+    page_i32,
     token_in_page,
     lane_div_16,
 ):
-    """Load the two 16-byte MFMA fragments from shuffle_weight layout."""
+    """Load the two 16-byte MFMA fragments from shuffle_weight layout.
+
+    ``page_i32`` is the page origin in i32 units, so packed 8448-byte pages and
+    split 8192-byte pages share the same in-page shuffle addressing.
+    """
     token_block = token_in_page // fx.Int32(16)
     token_lane = token_in_page % fx.Int32(16)
     dim_block = lane_div_16 * fx.Int32(2)
-    byte_offset = (
-        page_base
-        + token_block * fx.Int32(16 * HEAD_DIM)
-        + dim_block * fx.Int32(16 * 16)
-        + token_lane * fx.Int32(16)
+    off = (
+        page_i32
+        + token_block * fx.Int32(16 * HEAD_DIM // 4)
+        + dim_block * fx.Int32(16 * 16 // 4)
+        + token_lane * fx.Int32(4)
     )
-    lo = i32_view.vec_load((byte_offset // fx.Int32(4),), vec_size=4)
-    hi = i32_view.vec_load(
-        ((byte_offset + fx.Int32(16 * 16)) // fx.Int32(4),),
-        vec_size=4,
-    )
+    lo = i32_view.vec_load((off,), vec_size=4)
+    hi = i32_view.vec_load((off + fx.Int32(16 * 16 // 4),), vec_size=4)
     return _concat_i32x4(lo, hi)
 
 
@@ -154,40 +155,52 @@ def compile_fp8_paged_mqa_local_topk(
     block_i32 = page_size * page_index_dim // 4
     scale_i32 = page_size * HEAD_DIM // 4
 
+    # Packed pages are 8448 B = 8192+256; split pages are 8192 B. Both are
+    # page_size*128 of K, so in-page K addressing is identical once the origin
+    # is an i32 page base. page_size 64 is (p<<11)+(p<<6) vs p<<11 — not a
+    # gather stride on the K payload.
+    if page_size == 64 and packed:
+
+        def _page_i32(physical_page):
+            return (physical_page << 11) + (physical_page << 6)
+
+    elif page_size == 64:
+
+        def _page_i32(physical_page):
+            return physical_page << 11
+
+    else:
+
+        def _page_i32(physical_page):
+            return physical_page * fx.Int32(block_i32)
+
     if preshuffled:
 
-        def _load_k(kv_i32, physical_page, token_in_page, physical, page_size, lane):
+        def _load_k(kv_i32, page_i32, token_in_page, lane):
             return _load_preshuffled_fp8x32(
                 kv_i32,
-                physical_page * page_size * fx.Int32(page_index_dim),
+                page_i32,
                 token_in_page,
                 lane,
             )
 
     else:
 
-        def _load_k(kv_i32, physical_page, token_in_page, physical, page_size, lane):
-            byte_base = (
-                physical_page * page_size * fx.Int32(page_index_dim)
-                + token_in_page * fx.Int32(HEAD_DIM)
-            )
+        def _load_k(kv_i32, page_i32, token_in_page, lane):
+            byte_base = (page_i32 << 2) + token_in_page * fx.Int32(HEAD_DIM)
             return _load_fp8x32(kv_i32, byte_base, lane)
 
     if packed:
 
-        def _load_scale(scales, physical_page, token_in_page, physical):
+        def _load_scale(scales, page_i32, token_in_page):
             return fx.Float32(
-                scales[
-                    physical_page * fx.Int32(block_i32)
-                    + fx.Int32(scale_i32)
-                    + token_in_page
-                ]
+                scales[page_i32 + fx.Int32(scale_i32) + token_in_page]
             )
 
     else:
 
-        def _load_scale(scales, physical_page, token_in_page, physical):
-            return fx.Float32(scales[physical])
+        def _load_scale(scales, page_i32, token_in_page):
+            return fx.Float32(scales[(page_i32 >> 5) + token_in_page])
 
     @flyc.kernel(name=kernel_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -375,7 +388,7 @@ def compile_fp8_paged_mqa_local_topk(
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
                 table_offset = request * max_pages + _udiv(safe_logical, page_size_i32)
-                pages.append(fx.Int32(tables[table_offset]))
+                pages.append(_page_i32(fx.Int32(tables[table_offset])))
             return pages
 
         def _load_chunk(col0, pages):
@@ -390,18 +403,15 @@ def compile_fp8_paged_mqa_local_topk(
                     + lane_mod_16
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
-                physical_page = pages[ni]
+                page_i32 = pages[ni]
                 token_in_page = _umod(safe_logical, page_size_i32)
-                physical = physical_page * page_size_i32 + token_in_page
                 k_pack = _load_k(
                     kv_i32,
-                    physical_page,
+                    page_i32,
                     token_in_page,
-                    physical,
-                    page_size_i32,
                     lane_div_16,
                 )
-                scale = _load_scale(scales, physical_page, token_in_page, physical)
+                scale = _load_scale(scales, page_i32, token_in_page)
                 logical_tiles.append(logical)
                 k_packs.append(k_pack)
                 scale_tiles.append(scale)
