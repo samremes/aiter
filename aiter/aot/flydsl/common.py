@@ -34,6 +34,7 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
+    PAGED_MQA_STAGE_A = "paged_mqa_stage_a"
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.PAGED_MQA_STAGE_A:
+        from .paged_mqa_stage_a import collect_jobs
+
+        return collect_jobs()
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
@@ -162,6 +167,8 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
+    elif kind is OpKind.PAGED_MQA_STAGE_A:
+        from .paged_mqa_stage_a import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
         # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
         # trivial stub so the dispatch is total.

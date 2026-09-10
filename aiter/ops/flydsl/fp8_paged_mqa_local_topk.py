@@ -10,11 +10,11 @@ import torch
 from aiter.ops.topk import top_k_per_row_decode
 
 from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
+    HEAD_DIM,
+    INDEX_DIM,
     NUM_XCD,
     SUPPORTED_K,
     WORKGROUPS_PER_CU,
-    HEAD_DIM,
-    INDEX_DIM,
     launch_fp8_paged_mqa_local_topk,
 )
 from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
@@ -155,10 +155,16 @@ def flydsl_fp8_paged_mqa_local_topk(
 ):
     """Compute exact H32D128 FP8 scores and retain local TopK per history split.
 
-    Candidate order is unspecified. Positions are logical history positions.
+    Live candidates are emitted in descending score order; equal scores are
+    unordered. Positions are logical history positions.
     Set ``preshuffled=True`` when ``kv_cache`` uses
     ``shuffle_weight(..., layout=(16,16))`` within each page. This experimental
     API never allocates a full-width logits tensor.
+
+    Row lengths larger than ``block_tables.shape[1] * page_size`` are clamped
+    to that table span. Block-table entries outside ``[0, num_pages)`` are not
+    scored (they contribute ``-inf``); the kernel will not index the KV cache
+    with those ids.
     """
     for name, tensor in (
         ("q_fp8", q_fp8),
@@ -176,6 +182,8 @@ def flydsl_fp8_paged_mqa_local_topk(
     kv_cache, k_scales, packed, num_pages, page_size = _normalize_kv_inputs(
         kv_cache, k_scales, q_fp8.dtype
     )
+    if num_pages < 1:
+        raise ValueError("kv_cache must contain at least one page")
     tensors = (kv_cache, k_scales, weights, context_lens, block_tables)
     if any(t.device != device for t in tensors):
         raise ValueError("all inputs must be on the same device")
@@ -276,7 +284,11 @@ def flydsl_fp8_paged_mqa_topk(
     k=2048,
     num_splits=None,
 ):
-    """Compute exact TopK through compact split-local candidate bags."""
+    """Compute exact TopK through compact split-local candidate bags.
+
+    Packed pages may pass ``k_scales=None``. Lengths and block-table ids follow
+    the same safety contract as ``flydsl_fp8_paged_mqa_local_topk``.
+    """
     for name, tensor in (
         ("q_fp8", q_fp8),
         ("kv_cache", kv_cache),
@@ -293,6 +305,8 @@ def flydsl_fp8_paged_mqa_topk(
     kv_cache, k_scales, packed, num_pages, page_size = _normalize_kv_inputs(
         kv_cache, k_scales, q_fp8.dtype
     )
+    if num_pages < 1:
+        raise ValueError("kv_cache must contain at least one page")
     if any(
         tensor.device != device
         for tensor in (
@@ -321,8 +335,7 @@ def flydsl_fp8_paged_mqa_topk(
         raise ValueError(f"q_fp8 must be float8_e4m3fn, got {q_fp8.dtype}")
     if page_size != 64:
         raise ValueError(
-            "this specialization requires page_size 64, "
-            f"got {page_size}"
+            "this specialization requires page_size 64, " f"got {page_size}"
         )
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
         raise ValueError(f"weights must be float32 with shape {(rows, 32)}")
@@ -392,6 +405,7 @@ def flydsl_fp8_paged_mqa_topk(
             merge_histogram=workspace[0] if workspace is not None else None,
             merge_state=workspace[1] if workspace is not None else None,
             packed=packed,
+            ordered_emit=False,
         )
         if workspace is None:
             values = candidate_scores[:, 0]

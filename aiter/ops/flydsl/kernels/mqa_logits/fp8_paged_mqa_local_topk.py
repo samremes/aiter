@@ -45,6 +45,24 @@ NUM_XCD = 8
 WORKGROUPS_PER_CU = 16 // PROFILE_WAVES
 SUPPORTED_K = (128, 512, 1024, 2048)
 
+
+def fp8_paged_mqa_local_topk_kernel_name(
+    *,
+    topk: int,
+    arch: str,
+    preshuffled: bool,
+    packed: bool,
+    prepare_merge: bool,
+    ordered_emit: bool = True,
+) -> str:
+    layout_name = "preshuffled" if preshuffled else "rowmajor"
+    packed_tag = "_packed" if packed else ""
+    return (
+        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
+        f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
+        f"pm{int(prepare_merge)}_oe{int(ordered_emit)}_bitonic_{arch}"
+    )
+
 _RETAINED = 0
 _SCORE_PREFIX = 1
 _SCORE_MASK = 2
@@ -125,6 +143,7 @@ def compile_fp8_paged_mqa_local_topk(
     page_size: int,
     prepare_merge: bool = False,
     packed: bool = False,
+    ordered_emit: bool = True,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -133,7 +152,6 @@ def compile_fp8_paged_mqa_local_topk(
         raise RuntimeError(
             "the initial native-e4m3fn Stage-A specialization supports gfx950 only"
         )
-
     pool_capacity = topk + INCOMING_CAPACITY
     pool_steps = (pool_capacity + BLOCK_THREADS - 1) // BLOCK_THREADS
     output_steps = (topk + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -144,12 +162,13 @@ def compile_fp8_paged_mqa_local_topk(
         num_waves=WAVES,
     )
     block_exclusive_prefix_i32 = make_block_exclusive_prefix_i32(WAVES)
-    layout_name = "preshuffled" if preshuffled else "rowmajor"
-    packed_tag = "_packed" if packed else ""
-    kernel_name = (
-        f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
-        f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
-        f"pm{int(prepare_merge)}_xcdswap_{arch}"
+    kernel_name = fp8_paged_mqa_local_topk_kernel_name(
+        topk=topk,
+        arch=arch,
+        preshuffled=preshuffled,
+        packed=packed,
+        prepare_merge=prepare_merge,
+        ordered_emit=ordered_emit,
     )
     page_index_dim = INDEX_DIM if packed else HEAD_DIM
     block_i32 = page_size * page_index_dim // 4
@@ -193,9 +212,7 @@ def compile_fp8_paged_mqa_local_topk(
     if packed:
 
         def _load_scale(scales, page_i32, token_in_page):
-            return fx.Float32(
-                scales[page_i32 + fx.Int32(scale_i32) + token_in_page]
-            )
+            return fx.Float32(scales[page_i32 + fx.Int32(scale_i32) + token_in_page])
 
     else:
 
@@ -218,6 +235,7 @@ def compile_fp8_paged_mqa_local_topk(
         next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
+        num_pages: fx.Int32,
     ):
         page_size_i32 = fx.Int32(page_size)
         tid = fx.Int32(gpu.thread_idx.x)
@@ -244,7 +262,9 @@ def compile_fp8_paged_mqa_local_topk(
         scan = storage.scan.peek().view(fx.make_layout(WAVES + 1, 1))
         state = storage.state.peek().view(fx.make_layout(_STATE_SIZE, 1))
 
-        valid_len = fx.Int32(lengths[row])
+        table_span = max_pages * page_size_i32
+        valid_len = _imin(fx.Int32(lengths[row]), table_span)
+        valid_len = (valid_len < 0).select(fx.Int32(0), valid_len)
         split_begin = _udiv(valid_len * split, num_splits)
         split_end = _udiv(
             valid_len * (split + fx.Int32(1)),
@@ -374,12 +394,83 @@ def compile_fp8_paged_mqa_local_topk(
                 state[_RETAINED] = fx.Int32(topk)
             gpu.barrier()
 
+        def _sort_survivors(retained, pool_values, pool_indices):
+            """Sort the final bag into descending score order.
+
+            Compact already reduced to ``retained <= k`` in ``pool[0:retained)``.
+            Pad the unused ``[retained, k)`` slots with ``-inf`` so every
+            supported ``k`` (a power of two) can use a full bitonic network.
+            Each stage reads one k-wide LDS half and writes one value per lane
+            to the other half; waitcnt plus the block barrier separates stages.
+            Equal keys do not swap, so live ``-inf`` scores keep their indices
+            instead of exchanging with pad slots. Intermediate compact stays
+            unordered; only the emit bag is sorted.
+            """
+            for step in range_constexpr(output_steps):
+                slot = fx.Int32(step * BLOCK_THREADS) + tid
+                if (slot >= retained) & (slot < fx.Int32(topk)):
+                    pool_values[slot] = fx.Float32(float("-inf"))
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+
+            source_offset = 0
+            destination_offset = topk
+            k_size = 2
+            while k_size <= topk:
+                j = k_size // 2
+                while j > 0:
+                    for step in range_constexpr(output_steps):
+                        i = fx.Int32(step * BLOCK_THREADS) + tid
+                        partner = i ^ fx.Int32(j)
+                        if i < fx.Int32(topk):
+                            va = pool_values[fx.Int32(source_offset) + i]
+                            vb = pool_values[fx.Int32(source_offset) + partner]
+                            ia = pool_indices[fx.Int32(source_offset) + i]
+                            ib = pool_indices[fx.Int32(source_offset) + partner]
+                            ka = f32_to_ordered_i32(va)
+                            kb = f32_to_ordered_i32(vb)
+                            descending_half = (i & fx.Int32(k_size)) == 0
+                            low_member = (i & fx.Int32(j)) == 0
+                            take_max = descending_half == low_member
+                            take_partner = take_max.select(
+                                kb > ka,
+                                kb < ka,
+                            )
+                            pool_values[fx.Int32(destination_offset) + i] = (
+                                take_partner.select(vb, va)
+                            )
+                            pool_indices[fx.Int32(destination_offset) + i] = (
+                                take_partner.select(ib, ia)
+                            )
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    gpu.barrier()
+                    source_offset, destination_offset = (
+                        destination_offset,
+                        source_offset,
+                    )
+                    j //= 2
+                k_size *= 2
+
+            if source_offset != 0:
+                for step in range_constexpr(output_steps):
+                    slot = fx.Int32(step * BLOCK_THREADS) + tid
+                    if slot < fx.Int32(topk):
+                        pool_values[slot] = pool_values[
+                            fx.Int32(source_offset) + slot
+                        ]
+                        pool_indices[slot] = pool_indices[
+                            fx.Int32(source_offset) + slot
+                        ]
+                rocdl.s_waitcnt(lgkmcnt=0)
+                gpu.barrier()
+
         neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
         result_type = fx.Vector.make_type(DREG, fx.Float32)
 
         def _load_pages(col0):
             wave_tile_base = wave * fx.Int32(N_TILES_PER_WAVE)
-            pages = []
+            page_i32s = []
+            page_oks = []
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 logical = (
                     col0
@@ -388,14 +479,19 @@ def compile_fp8_paged_mqa_local_topk(
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
                 table_offset = request * max_pages + _udiv(safe_logical, page_size_i32)
-                pages.append(_page_i32(fx.Int32(tables[table_offset])))
-            return pages
+                physical_page = fx.Int32(tables[table_offset])
+                page_ok = (physical_page >= 0) & (physical_page < num_pages)
+                safe_page = page_ok.select(physical_page, fx.Int32(0))
+                page_i32s.append(_page_i32(safe_page))
+                page_oks.append(page_ok)
+            return page_i32s, page_oks
 
-        def _load_chunk(col0, pages):
+        def _load_chunk(col0, page_i32s, page_oks):
             wave_tile_base = wave * fx.Int32(N_TILES_PER_WAVE)
             logical_tiles = []
             k_packs = []
             scale_tiles = []
+            chunk_oks = []
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 logical = (
                     col0
@@ -403,7 +499,7 @@ def compile_fp8_paged_mqa_local_topk(
                     + lane_mod_16
                 )
                 safe_logical = _imin(logical, split_end - fx.Int32(1))
-                page_i32 = pages[ni]
+                page_i32 = page_i32s[ni]
                 token_in_page = _umod(safe_logical, page_size_i32)
                 k_pack = _load_k(
                     kv_i32,
@@ -415,7 +511,8 @@ def compile_fp8_paged_mqa_local_topk(
                 logical_tiles.append(logical)
                 k_packs.append(k_pack)
                 scale_tiles.append(scale)
-            return logical_tiles, k_packs, scale_tiles
+                chunk_oks.append(page_oks[ni])
+            return logical_tiles, k_packs, scale_tiles, chunk_oks
 
         @flyc.jit
         def _write_candidate(
@@ -430,7 +527,7 @@ def compile_fp8_paged_mqa_local_topk(
                 _values[_dst] = _score
                 _indices[_dst] = fx.Uint16(_relative)
 
-        def _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles):
+        def _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, page_oks):
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 logical = logical_tiles[ni]
                 k_pack = k_packs[ni]
@@ -461,6 +558,7 @@ def compile_fp8_paged_mqa_local_topk(
                         total = total + activated * weight
                 total = total + total.shuffle_xor(16, WAVE_SIZE)
                 total = total + total.shuffle_xor(32, WAVE_SIZE)
+                total = page_oks[ni].select(total, fx.Float32(float("-inf")))
 
                 is_writer = (lane_div_16 == 0) & (logical < split_end)
                 destination = state[_RETAINED] + logical - batch_first
@@ -491,24 +589,29 @@ def compile_fp8_paged_mqa_local_topk(
         for col0 in range(split_begin, paired_end, group_n):
             batch_tile = _umod(tile_number, TILES_PER_COMPACT)
             batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
-            pages = _load_pages(col0)
-            next_pages = _load_pages(col0 + fx.Int32(BLOCK_N))
-            logical_tiles, k_packs, scale_tiles = _load_chunk(col0, pages)
-            next_logical_tiles, next_k_packs, next_scale_tiles = _load_chunk(
-                col0 + fx.Int32(BLOCK_N),
-                next_pages,
+            page_i32s, page_oks = _load_pages(col0)
+            next_i32s, next_oks = _load_pages(col0 + fx.Int32(BLOCK_N))
+            logical_tiles, k_packs, scale_tiles, chunk_oks = _load_chunk(
+                col0, page_i32s, page_oks
             )
-            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles)
+            next_logical_tiles, next_k_packs, next_scale_tiles, next_chunk_oks = (
+                _load_chunk(
+                    col0 + fx.Int32(BLOCK_N),
+                    next_i32s,
+                    next_oks,
+                )
+            )
+            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, chunk_oks)
             _score_chunk(
                 batch_first,
                 next_logical_tiles,
                 next_k_packs,
                 next_scale_tiles,
+                next_chunk_oks,
             )
 
-            end_of_batch = (
-                batch_tile + fx.Int32(tiles_per_group)
-                >= fx.Int32(TILES_PER_COMPACT)
+            end_of_batch = batch_tile + fx.Int32(tiles_per_group) >= fx.Int32(
+                TILES_PER_COMPACT
             )
             final_tile = col0 + group_n >= split_end
             if end_of_batch | final_tile:
@@ -534,9 +637,11 @@ def compile_fp8_paged_mqa_local_topk(
         for col0 in range(paired_end, split_end, fx.Int32(BLOCK_N)):
             batch_tile = _umod(tile_number, TILES_PER_COMPACT)
             batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
-            pages = _load_pages(col0)
-            logical_tiles, k_packs, scale_tiles = _load_chunk(col0, pages)
-            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles)
+            page_i32s, page_oks = _load_pages(col0)
+            logical_tiles, k_packs, scale_tiles, chunk_oks = _load_chunk(
+                col0, page_i32s, page_oks
+            )
+            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, chunk_oks)
 
             gpu.barrier()
             incoming_count = split_end - batch_first
@@ -557,6 +662,8 @@ def compile_fp8_paged_mqa_local_topk(
             tile_number = tile_number + fx.Int32(1)
 
         retained = state[_RETAINED]
+        if const_expr(ordered_emit):
+            _sort_survivors(retained, pool_values, pool_indices)
         output_scores_row = fx.slice(
             candidate_scores,
             (row, split, None),
@@ -666,6 +773,7 @@ def compile_fp8_paged_mqa_local_topk(
         next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
+        num_pages: fx.Int32,
         stream: fx.Stream,
     ):
         gx = arith.index_cast(T.index, _to_raw(num_splits))
@@ -685,6 +793,7 @@ def compile_fp8_paged_mqa_local_topk(
             next_n,
             num_splits,
             max_pages,
+            num_pages,
         ).launch(grid=(gx, gy, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     launch.compile_hints = {"waves_per_eu": 1, "fast_fp_math": True}
@@ -711,6 +820,7 @@ def launch_fp8_paged_mqa_local_topk(
     merge_histogram=None,
     merge_state=None,
     packed=False,
+    ordered_emit=True,
 ):
     page_size = kv_cache.shape[1]
     batch, next_n, _, _ = q_fp8.shape
@@ -722,8 +832,10 @@ def launch_fp8_paged_mqa_local_topk(
         page_size=page_size,
         prepare_merge=prepare_merge,
         packed=packed,
+        ordered_emit=ordered_emit,
     )
     max_pages = block_tables.shape[1]
+    num_pages = kv_cache.shape[0]
     if merge_histogram is None:
         merge_histogram = candidate_scores
     if merge_state is None:
@@ -745,5 +857,6 @@ def launch_fp8_paged_mqa_local_topk(
         next_n,
         num_splits,
         max_pages,
+        num_pages,
         stream,
     )
