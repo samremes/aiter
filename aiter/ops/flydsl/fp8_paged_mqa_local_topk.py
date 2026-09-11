@@ -17,7 +17,13 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     WORKGROUPS_PER_CU,
     launch_fp8_paged_mqa_local_topk,
 )
-from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
+from .split_topk_merge import (
+    persistent_merge_parts,
+    persistent_split_topk_merge_views,
+    persistent_split_topk_merge_workspace,
+    split_topk_merge,
+    split_topk_merge_workspace,
+)
 
 SUPPORTED_ARCHES = ("gfx950",)
 
@@ -283,6 +289,7 @@ def flydsl_fp8_paged_mqa_topk(
     *,
     k=2048,
     num_splits=None,
+    persistent_merge=False,
 ):
     """Compute exact TopK through compact split-local candidate bags.
 
@@ -383,7 +390,21 @@ def flydsl_fp8_paged_mqa_topk(
         dtype=torch.int32,
         device=device,
     )
-    workspace = split_topk_merge_workspace(device, rows) if num_splits > 1 else None
+    use_persistent = False
+    flat_workspace = None
+    workspace = None
+    if num_splits > 1:
+        if persistent_merge:
+            props = torch.cuda.get_device_properties(device)
+            parts = persistent_merge_parts(
+                rows, num_splits, props.multi_processor_count
+            )
+            use_persistent = parts >= 2
+        if use_persistent:
+            flat_workspace = persistent_split_topk_merge_workspace(device, rows)
+            workspace = persistent_split_topk_merge_views(flat_workspace, rows)
+        else:
+            workspace = split_topk_merge_workspace(device, rows)
     stream = torch.cuda.current_stream(device)
     with torch.cuda.device(device):
         launch_fp8_paged_mqa_local_topk(
@@ -406,6 +427,8 @@ def flydsl_fp8_paged_mqa_topk(
             merge_state=workspace[1] if workspace is not None else None,
             packed=packed,
             ordered_emit=False,
+            restore_merge_workspace=use_persistent,
+            merge_workspace=flat_workspace,
         )
         if workspace is None:
             values = candidate_scores[:, 0]
@@ -418,6 +441,8 @@ def flydsl_fp8_paged_mqa_topk(
                 k=k,
                 precomputed_first_pass=True,
                 workspace=workspace,
+                persistent=use_persistent,
+                persistent_workspace=flat_workspace,
             )
     return values, positions
 

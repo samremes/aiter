@@ -5,6 +5,9 @@
 
 import argparse
 import itertools
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 
 import pandas as pd
@@ -26,6 +29,8 @@ from aiter.ops.flydsl.fp8_paged_mqa_local_topk import (
 from aiter.ops.flydsl.split_topk_merge import (
     clear_split_topk_merge_workspace_cache,
     multisequence_sorted_split_topk_merge,
+    persistent_split_topk_merge_workspace,
+    restore_persistent_b_private,
     split_topk_merge,
 )
 from aiter.ops.shuffle import shuffle_weight
@@ -64,13 +69,20 @@ def _make_case(
     seed=17,
     ragged=False,
     next_n=1,
+    independent_kv=False,
+    context_len=None,
 ):
     if rows % next_n:
         raise ValueError("rows must be divisible by next_n")
     batch = rows // next_n
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
-    pages = max(1, (length + page_size - 1) // page_size)
+    if context_len is None:
+        context_len = length
+    if context_len < 1 or context_len > length:
+        raise ValueError("context_len must be in [1, length]")
+    context_pages = max(1, (context_len + page_size - 1) // page_size)
+    table_pages = max(1, (length + page_size - 1) // page_size)
     q = (
         torch.randn(
             batch,
@@ -82,6 +94,7 @@ def _make_case(
         )
         * 0.25
     ).to(torch.float8_e4m3fn)
+    pages = batch * context_pages if independent_kv else context_pages
     kv = (
         torch.randn(pages, page_size, HEAD_DIM, device=device, generator=generator)
         * 0.25
@@ -92,7 +105,7 @@ def _make_case(
     weights = torch.randn(
         rows, HEADS, device=device, generator=generator, dtype=torch.float32
     )
-    lengths = torch.full((rows,), length, device=device, dtype=torch.int32)
+    lengths = torch.full((rows,), context_len, device=device, dtype=torch.int32)
     if next_n > 1:
         causal_offsets = torch.arange(
             1 - next_n,
@@ -103,7 +116,7 @@ def _make_case(
         lengths = (
             torch.full(
                 (batch, next_n),
-                length,
+                context_len,
                 device=device,
                 dtype=torch.int32,
             )
@@ -112,9 +125,22 @@ def _make_case(
     if ragged and rows > 1:
         flat_lengths = lengths.reshape(-1)
         flat_lengths[0] = 0
-        flat_lengths[-1] = max(0, length - 3)
-    physical_order = torch.randperm(pages, device=device, generator=generator)
-    block_tables = physical_order.repeat(batch, 1).to(torch.int32)
+        flat_lengths[-1] = max(0, context_len - 3)
+    block_tables = torch.zeros(
+        (batch, table_pages), device=device, dtype=torch.int32
+    )
+    if independent_kv:
+        for req in range(batch):
+            origin = req * context_pages
+            perm = torch.randperm(
+                context_pages, device=device, generator=generator
+            )
+            block_tables[req, :context_pages] = (perm + origin).to(torch.int32)
+    else:
+        physical_order = torch.randperm(
+            context_pages, device=device, generator=generator
+        )
+        block_tables[:, :context_pages] = physical_order.to(torch.int32)
     return Case(q, kv, scales, weights, lengths, block_tables)
 
 
@@ -1143,6 +1169,380 @@ def benchmark_auto_topk(rows, next_n, length, k, page_size):
         "flydsl_auto_topk TB/s": nbytes / us / 1e6,
         "flydsl_auto_topk err": err,
     }
+
+
+def _ordered_i32(values):
+    bits = values.view(torch.int32)
+    ordered = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    abs_bits = bits & 0x7FFFFFFF
+    nan = abs_bits > 0x7F800000
+    return torch.where(nan, torch.full_like(bits, -(1 << 31)), ordered)
+
+
+def _prepare_pass0_workspace(scores, counts, workspace):
+    from aiter.ops.flydsl.kernels.split_topk_merge_layout import (
+        HIST0_OFF,
+        NUM_HIST_BINS,
+        ROW_STRIDE,
+    )
+
+    rows, splits, local_k = scores.shape
+    restore_persistent_b_private(workspace, rows)
+    rows_view = workspace.view(rows, ROW_STRIDE)
+    rows_view[:, HIST0_OFF : HIST0_OFF + NUM_HIST_BINS].zero_()
+    sign = 1 << 10
+    for row in range(rows):
+        for split in range(splits):
+            count = int(counts[row, split].clamp(min=0).item())
+            count = min(count, local_k)
+            if count <= 0:
+                continue
+            keys = _ordered_i32(scores[row, split, :count])
+            buckets = ((keys >> 21) & 2047) ^ sign
+            hist = workspace[
+                row * ROW_STRIDE
+                + HIST0_OFF : row * ROW_STRIDE
+                + HIST0_OFF
+                + NUM_HIST_BINS
+            ]
+            hist.scatter_add_(0, buckets.long(), torch.ones_like(buckets))
+
+
+def _assert_unique_kth_set(scores, positions, counts, selected, k):
+    rows, splits, _ = scores.shape
+    for row in range(rows):
+        live_scores = []
+        live_positions = []
+        for split in range(splits):
+            count = int(max(0, min(k, int(counts[row, split]))))
+            if count == 0:
+                continue
+            live_scores.append(scores[row, split, :count])
+            live_positions.append(positions[row, split, :count])
+        if not live_scores:
+            continue
+        cat_scores = torch.nan_to_num(torch.cat(live_scores), nan=float("-inf"))
+        cat_positions = torch.cat(live_positions)
+        take = min(k, int(cat_scores.numel()))
+        ordered = torch.sort(cat_scores, descending=True).values
+        unique_kth = take == k and (
+            int(cat_scores.numel()) == k or ordered[k - 1] > ordered[k]
+        )
+        got = [int(x) for x in selected[row].tolist() if x >= 0]
+        assert len(set(got)) == take
+        if unique_kth:
+            expected = set(
+                cat_positions[torch.topk(cat_scores, take).indices].cpu().tolist()
+            )
+            assert set(got) == expected
+
+
+def _synthetic_bags(rows, splits, k, seed=3):
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    scores = torch.randn(rows, splits, k, device=device, generator=generator)
+    positions = (
+        torch.arange(splits * k, device=device, dtype=torch.int32)
+        .view(1, splits, k)
+        .expand(rows, -1, -1)
+        .contiguous()
+    )
+    counts = torch.full((rows, splits), k, dtype=torch.int32, device=device)
+    return scores, positions, counts
+
+
+def _run_direct_persistent(rows, splits, k, seed=3):
+    scores, positions, counts = _synthetic_bags(rows, splits, k, seed=seed)
+    workspace = persistent_split_topk_merge_workspace(scores.device, rows)
+    _prepare_pass0_workspace(scores, counts, workspace)
+    _, selected = split_topk_merge(
+        scores,
+        positions,
+        counts,
+        k=k,
+        precomputed_first_pass=True,
+        persistent=True,
+        persistent_workspace=workspace,
+    )
+    _assert_unique_kth_set(scores, positions, counts, selected, k)
+    _, radix_pos = split_topk_merge(
+        scores,
+        positions,
+        counts,
+        k=k,
+        precomputed_first_pass=False,
+    )
+    for row in range(rows):
+        got = set(int(x) for x in selected[row].tolist() if x >= 0)
+        ref = set(int(x) for x in radix_pos[row].tolist() if x >= 0)
+        assert got == ref
+    return selected
+
+
+def _run_persistent_from_stage_a(rows, splits, k, length, seed=47):
+    case = _make_case(rows, length, 64, seed=seed)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    args = (
+        case.q,
+        packed,
+        None,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+    )
+    scores, positions = flydsl_fp8_paged_mqa_topk(
+        *args, k=k, num_splits=splits, persistent_merge=True
+    )
+    radix_scores, radix_positions = flydsl_fp8_paged_mqa_topk(
+        *args, k=k, num_splits=splits, persistent_merge=False
+    )
+    reference = run_torch(case)
+    lengths = case.lengths.reshape(-1)
+    for row in range(rows):
+        take = min(k, int(lengths[row]))
+        got = [int(x) for x in positions[row].cpu().tolist() if x >= 0]
+        radix_got = [int(x) for x in radix_positions[row].cpu().tolist() if x >= 0]
+        assert len(set(got)) == take
+        assert set(got) == set(radix_got), f"row {row} persistent vs radix set mismatch"
+        row_ref = reference[row]
+        checkAllclose(
+            torch.sort(row_ref[positions[row].long()], descending=True).values.float(),
+            torch.topk(row_ref, take, sorted=True).values.float(),
+            rtol=2e-4,
+            atol=2e-4,
+            msg=f"persistent_from_stage_a row {row} scores",
+        )
+    return scores, positions
+
+
+def test_persistent_split_topk_merge_small_and_nan():
+    _require_supported_gpu()
+    rows, splits, k = 2, 4, 128
+    selected = _run_direct_persistent(rows, splits, k)
+    assert selected.shape == (rows, k)
+
+    counts = torch.tensor(
+        [[128, 90, 128, 40], [80, 128, 70, 128]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    scores = torch.full((rows, splits, k), float("-inf"), device="cuda")
+    positions = torch.full((rows, splits, k), -1, dtype=torch.int32, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(59)
+    for row in range(rows):
+        base = 0
+        for split in range(splits):
+            count = int(counts[row, split])
+            scores[row, split, :count] = torch.randn(
+                count, generator=generator, device="cuda"
+            )
+            positions[row, split, :count] = torch.arange(
+                base, base + count, dtype=torch.int32, device="cuda"
+            )
+            base += count
+        scores[row, 0, :16] = float("nan")
+    workspace = persistent_split_topk_merge_workspace(torch.device("cuda"), rows)
+    _prepare_pass0_workspace(scores, counts, workspace)
+    _, selected = split_topk_merge(
+        scores,
+        positions,
+        counts,
+        k=k,
+        precomputed_first_pass=True,
+        persistent=True,
+        persistent_workspace=workspace,
+    )
+    _assert_unique_kth_set(scores, positions, counts, selected, k)
+
+    tie_scores = torch.full_like(scores, float("-inf"))
+    for row in range(rows):
+        for split in range(splits):
+            tie_scores[row, split, : int(counts[row, split])] = 0
+    _prepare_pass0_workspace(tie_scores, counts, workspace)
+    values, tie_positions = split_topk_merge(
+        tie_scores,
+        positions,
+        counts,
+        k=k,
+        precomputed_first_pass=True,
+        persistent=True,
+        persistent_workspace=workspace,
+    )
+    assert torch.equal(values, torch.zeros_like(values))
+    for row in range(rows):
+        chosen = [int(x) for x in tie_positions[row].tolist() if x >= 0]
+        assert len(set(chosen)) == k
+        assert min(chosen) >= 0
+
+
+def test_persistent_production_shapes_subprocess():
+    _require_supported_gpu()
+    cases = (
+        (8, 32, 2048, 8193, 90),
+        (16, 32, 2048, 8193, 90),
+        (32, 16, 2048, 8193, 90),
+        (8, 8, 2048, 8193, 60),
+    )
+    env = os.environ.copy()
+    root = "/home/samremes/dev/aiter-dsa-indexer-stage-a"
+    env["PYTHONPATH"] = root + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("HIP_VISIBLE_DEVICES", os.environ.get("HIP_VISIBLE_DEVICES", "0"))
+    for rows, splits, k, length, timeout in cases:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from op_tests.test_flydsl_fp8_paged_mqa_local_topk import "
+                    "_run_persistent_from_stage_a; "
+                    f"_run_persistent_from_stage_a({rows}, {splits}, {k}, {length})"
+                ),
+            ],
+            cwd=root,
+            env=env,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_persistent_refuses_missing_and_dirty_workspace():
+    _require_supported_gpu()
+    rows, splits, k = 2, 4, 128
+    scores, positions, counts = _synthetic_bags(rows, splits, k)
+    with pytest.raises(ValueError, match="persistent_workspace"):
+        split_topk_merge(
+            scores,
+            positions,
+            counts,
+            k=k,
+            persistent=True,
+        )
+    workspace = persistent_split_topk_merge_workspace(scores.device, rows)
+    _prepare_pass0_workspace(scores, counts, workspace)
+    split_topk_merge(
+        scores,
+        positions,
+        counts,
+        k=k,
+        precomputed_first_pass=True,
+        persistent=True,
+        persistent_workspace=workspace,
+    )
+    with pytest.raises(RuntimeError, match="dirty"):
+        split_topk_merge(
+            scores,
+            positions,
+            counts,
+            k=k,
+            precomputed_first_pass=True,
+            persistent=True,
+            persistent_workspace=workspace,
+        )
+
+
+def test_persistent_b_only_second_launch_subprocess():
+    _require_supported_gpu()
+    env = os.environ.copy()
+    root = "/home/samremes/dev/aiter-dsa-indexer-stage-a"
+    env["PYTHONPATH"] = root + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.setdefault("HIP_VISIBLE_DEVICES", os.environ.get("HIP_VISIBLE_DEVICES", "0"))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from op_tests.test_flydsl_fp8_paged_mqa_local_topk import "
+                "test_persistent_refuses_missing_and_dirty_workspace; "
+                "test_persistent_refuses_missing_and_dirty_workspace()"
+            ),
+        ],
+        cwd=root,
+        env=env,
+        timeout=30,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_persistent_e2e_eager_and_graph_replay():
+    _require_supported_gpu()
+    rows, length, k, splits = 2, 8193, 2048, 4
+    case = _make_case(rows, length, 64, seed=47)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    args = (
+        case.q,
+        packed,
+        None,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+    )
+    reference = run_torch(case)
+    scores, positions = flydsl_fp8_paged_mqa_topk(
+        *args, k=k, num_splits=splits, persistent_merge=True
+    )
+    for _ in range(32):
+        scores, positions = flydsl_fp8_paged_mqa_topk(
+            *args, k=k, num_splits=splits, persistent_merge=True
+        )
+    torch.cuda.synchronize()
+    for row in range(rows):
+        expected = set(
+            torch.topk(reference[row], k, sorted=False).indices.cpu().tolist()
+        )
+        got = set(int(x) for x in positions[row].cpu().tolist() if x >= 0)
+        assert got == expected
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        flydsl_fp8_paged_mqa_topk(
+            *args, k=k, num_splits=splits, persistent_merge=True
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay_scores, replay_positions = flydsl_fp8_paged_mqa_topk(
+                *args, k=k, num_splits=splits, persistent_merge=True
+            )
+    for _ in range(20):
+        graph.replay()
+    torch.cuda.synchronize()
+    for row in range(rows):
+        expected = set(
+            torch.topk(reference[row], k, sorted=False).indices.cpu().tolist()
+        )
+        got = set(int(x) for x in replay_positions[row].cpu().tolist() if x >= 0)
+        assert got == expected
+
+
+def test_persistent_packed_page64_e2e_k2048():
+    _require_supported_gpu()
+    rows, length, k, splits = 1, 8193, 2048, 2
+    case = _make_case(rows, length, 64, seed=47)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    scores, positions = flydsl_fp8_paged_mqa_topk(
+        case.q,
+        packed,
+        None,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        k=k,
+        num_splits=splits,
+        persistent_merge=True,
+    )
+    reference = run_torch(case)
+    expected = torch.topk(reference[0], k, sorted=False).indices
+    assert set(positions[0].cpu().tolist()) == set(expected.cpu().tolist())
+    checkAllclose(
+        reference[0][positions[0].long()].float(),
+        scores[0].float(),
+        rtol=2e-4,
+        atol=2e-4,
+        msg="persistent_e2e",
+    )
 
 
 def main():

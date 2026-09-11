@@ -12,6 +12,22 @@ from .kernels.sorted_split_topk_merge import (
     build_multisequence_sorted_split_topk_merge,
     build_parallel_multisequence_sorted_split_topk_merge,
 )
+from .kernels.split_topk_merge_layout import (
+    COUNTER_ARRIVALS,
+    COUNTER_GROUP,
+    HIST1_OFF,
+    HIST2_OFF,
+    NUM_HIST_BINS,
+    ROW_STRIDE,
+    STATE_OFF,
+    persistent_hist0_view,
+    persistent_state_view,
+    persistent_workspace_elems,
+)
+from .kernels.split_topk_merge_persistent import (
+    persistent_merge_parts,
+    run_split_topk_merge_persistent,
+)
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     _STATE_SIZE,
@@ -47,8 +63,24 @@ def _split_workspace(
     )
 
 
+@cache
+def _persistent_workspace(
+    device_index: int,
+    stream_id: int,
+    rows: int,
+) -> torch.Tensor:
+    del stream_id
+    device = torch.device("cuda", device_index)
+    return torch.zeros(
+        (persistent_workspace_elems(rows),),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
 def clear_split_topk_merge_workspace_cache() -> None:
     _split_workspace.cache_clear()
+    _persistent_workspace.cache_clear()
     _full_widths.cache_clear()
 
 
@@ -84,6 +116,44 @@ def split_topk_merge_workspace(
     return _split_workspace(device.index, stream.cuda_stream, rows)
 
 
+def persistent_split_topk_merge_workspace(
+    device: torch.device,
+    rows: int,
+) -> torch.Tensor:
+    """Return the init-once flat workspace used by persistent split TopK."""
+    stream = torch.cuda.current_stream(device)
+    return _persistent_workspace(device.index, stream.cuda_stream, rows)
+
+
+def persistent_split_topk_merge_views(workspace: torch.Tensor, rows: int):
+    """Histogram and state views Stage A expects over the flat workspace."""
+    return persistent_hist0_view(workspace, rows), persistent_state_view(
+        workspace, rows
+    )
+
+
+def restore_persistent_b_private(workspace: torch.Tensor, rows: int) -> None:
+    """Zero B-private slots without touching HIST0 or Stage A state.
+
+    This is the host equivalent of Stage A's in-kernel restore. Decode graphs
+    must use Stage A restore, not this helper.
+    """
+    if workspace.numel() != persistent_workspace_elems(rows):
+        raise ValueError(
+            f"persistent workspace must have {persistent_workspace_elems(rows)} "
+            f"elements, got {workspace.numel()}"
+        )
+    rows_view = workspace.view(rows, ROW_STRIDE)
+    rows_view[:, :COUNTER_GROUP].zero_()
+    rows_view[:, HIST1_OFF : HIST1_OFF + NUM_HIST_BINS].zero_()
+    rows_view[:, HIST2_OFF:STATE_OFF].zero_()
+
+
+def _persistent_workspace_is_dirty(workspace: torch.Tensor, rows: int) -> bool:
+    rows_view = workspace.view(rows, ROW_STRIDE)
+    return bool((rows_view[:, COUNTER_ARRIVALS] != 0).any())
+
+
 def _row_ends(device: torch.device, rows: int, width: int) -> torch.Tensor:
     if torch.cuda.is_current_stream_capturing():
         return torch.full(
@@ -103,6 +173,12 @@ def split_topk_merge(
     k: int,
     precomputed_first_pass: bool = False,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    persistent: bool = False,
+    persistent_workspace: torch.Tensor | None = None,
+    out_scores: torch.Tensor | None = None,
+    out_positions: torch.Tensor | None = None,
+    persistent_parts: int | None = None,
+    require_restored: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge unordered split-local TopK pairs into an unordered row TopK."""
     if candidate_scores.ndim != 3:
@@ -129,27 +205,83 @@ def split_topk_merge(
         raise ValueError("candidate tensors must share one device")
     if not candidate_scores.is_contiguous() or not candidate_positions.is_contiguous():
         raise ValueError("candidate scores and positions must be contiguous")
+    if candidate_counts.dtype != torch.int32:
+        raise TypeError("candidate_counts must be int32")
+    if not candidate_counts.is_contiguous():
+        raise ValueError("candidate_counts must be contiguous")
 
     device = candidate_scores.device
+    if persistent:
+        if persistent_workspace is None:
+            raise ValueError(
+                "persistent merge requires persistent_workspace restored by Stage A"
+            )
+        if persistent_workspace.dtype != torch.int32:
+            raise TypeError("persistent_workspace must be int32")
+        if not persistent_workspace.is_contiguous():
+            raise ValueError("persistent_workspace must be contiguous")
+        if persistent_workspace.numel() != persistent_workspace_elems(rows):
+            raise ValueError(
+                "persistent_workspace has "
+                f"{persistent_workspace.numel()} elements, expected "
+                f"{persistent_workspace_elems(rows)}"
+            )
+        if (
+            require_restored
+            and not torch.cuda.is_current_stream_capturing()
+            and _persistent_workspace_is_dirty(persistent_workspace, rows)
+        ):
+            raise RuntimeError(
+                "persistent merge workspace is dirty; run Stage A restore first"
+            )
+        props = torch.cuda.get_device_properties(device)
+        parts = persistent_parts or persistent_merge_parts(
+            rows, splits, props.multi_processor_count
+        )
+        if parts >= 2:
+            return run_split_topk_merge_persistent(
+                candidate_scores,
+                candidate_positions,
+                candidate_counts,
+                persistent_workspace,
+                k=k,
+                parts=parts,
+                out_scores=out_scores,
+                out_positions=out_positions,
+            )
+        workspace = persistent_split_topk_merge_views(persistent_workspace, rows)
+
     width = splits * k
     scores = candidate_scores.view(rows, width)
     positions = candidate_positions.view(rows, width)
-    if precomputed_first_pass:
-        selected_scores = torch.full(
-            (rows, k),
-            -float("inf"),
-            dtype=torch.float32,
-            device=device,
-        )
-        selected_positions = torch.full(
-            (rows, k),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
+    if out_scores is None:
+        if precomputed_first_pass:
+            selected_scores = torch.full(
+                (rows, k),
+                -float("inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            selected_scores = torch.empty(
+                (rows, k), dtype=torch.float32, device=device
+            )
     else:
-        selected_scores = torch.empty((rows, k), dtype=torch.float32, device=device)
-        selected_positions = torch.empty((rows, k), dtype=torch.int32, device=device)
+        selected_scores = out_scores
+    if out_positions is None:
+        if precomputed_first_pass:
+            selected_positions = torch.full(
+                (rows, k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            selected_positions = torch.empty(
+                (rows, k), dtype=torch.int32, device=device
+            )
+    else:
+        selected_positions = out_positions
     row_ends = _row_ends(device, rows, width)
     stream = torch.cuda.current_stream(device)
     partial_hist, state = (

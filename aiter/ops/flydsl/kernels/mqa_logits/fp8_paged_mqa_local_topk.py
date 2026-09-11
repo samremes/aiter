@@ -23,6 +23,12 @@ from ..candidate_topk_common import (
     radix_pass_bits,
 )
 from ..kernels_common import atomic_add_i32
+from ..split_topk_merge_layout import (
+    COUNTER_GROUP,
+    HIST1_OFF,
+    HIST2_OFF,
+    ROW_STRIDE,
+)
 from ..tensor_shim import GTensor, _run_compiled, _to_raw
 
 HEADS = 32
@@ -54,13 +60,15 @@ def fp8_paged_mqa_local_topk_kernel_name(
     packed: bool,
     prepare_merge: bool,
     ordered_emit: bool = True,
+    restore_merge_workspace: bool = False,
 ) -> str:
     layout_name = "preshuffled" if preshuffled else "rowmajor"
     packed_tag = "_packed" if packed else ""
     return (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
-        f"pm{int(prepare_merge)}_oe{int(ordered_emit)}_bitonic_{arch}"
+        f"pm{int(prepare_merge)}_oe{int(ordered_emit)}_"
+        f"rm{int(restore_merge_workspace)}_bitonic_{arch}"
     )
 
 _RETAINED = 0
@@ -144,6 +152,7 @@ def compile_fp8_paged_mqa_local_topk(
     prepare_merge: bool = False,
     packed: bool = False,
     ordered_emit: bool = True,
+    restore_merge_workspace: bool = False,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -169,6 +178,7 @@ def compile_fp8_paged_mqa_local_topk(
         packed=packed,
         prepare_merge=prepare_merge,
         ordered_emit=ordered_emit,
+        restore_merge_workspace=restore_merge_workspace,
     )
     page_index_dim = INDEX_DIM if packed else HEAD_DIM
     block_i32 = page_size * page_index_dim // 4
@@ -232,6 +242,7 @@ def compile_fp8_paged_mqa_local_topk(
         candidate_counts: fx.Tensor,
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
+        merge_workspace: fx.Tensor,
         next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
@@ -747,6 +758,15 @@ def compile_fp8_paged_mqa_local_topk(
                         "agent",
                     )
             gpu.barrier()
+        if const_expr(restore_merge_workspace):
+            if split == 0:
+                row_base = row * fx.Int32(ROW_STRIDE)
+                if tid < fx.Int32(COUNTER_GROUP):
+                    merge_workspace[row_base + tid] = 0
+                for hist_step in range_constexpr(NUM_HIST_BINS // BLOCK_THREADS):
+                    hist_bin = hist_step * BLOCK_THREADS + tid
+                    merge_workspace[row_base + fx.Int32(HIST1_OFF) + hist_bin] = 0
+                    merge_workspace[row_base + fx.Int32(HIST2_OFF) + hist_bin] = 0
         if tid == 0:
             fx.ptr_store(
                 retained,
@@ -769,6 +789,7 @@ def compile_fp8_paged_mqa_local_topk(
         candidate_counts: fx.Tensor,
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
+        merge_workspace: fx.Tensor,
         rows: fx.Int32,
         next_n: fx.Int32,
         num_splits: fx.Int32,
@@ -790,6 +811,7 @@ def compile_fp8_paged_mqa_local_topk(
             candidate_counts,
             merge_histogram,
             merge_state,
+            merge_workspace,
             next_n,
             num_splits,
             max_pages,
@@ -821,6 +843,8 @@ def launch_fp8_paged_mqa_local_topk(
     merge_state=None,
     packed=False,
     ordered_emit=True,
+    restore_merge_workspace=False,
+    merge_workspace=None,
 ):
     page_size = kv_cache.shape[1]
     batch, next_n, _, _ = q_fp8.shape
@@ -833,6 +857,7 @@ def launch_fp8_paged_mqa_local_topk(
         prepare_merge=prepare_merge,
         packed=packed,
         ordered_emit=ordered_emit,
+        restore_merge_workspace=restore_merge_workspace,
     )
     max_pages = block_tables.shape[1]
     num_pages = kv_cache.shape[0]
@@ -840,6 +865,8 @@ def launch_fp8_paged_mqa_local_topk(
         merge_histogram = candidate_scores
     if merge_state is None:
         merge_state = candidate_counts
+    if merge_workspace is None:
+        merge_workspace = merge_histogram
     _run_compiled(
         launcher,
         q_fp8,
@@ -853,6 +880,7 @@ def launch_fp8_paged_mqa_local_topk(
         candidate_counts,
         merge_histogram,
         merge_state,
+        merge_workspace,
         rows,
         next_n,
         num_splits,
