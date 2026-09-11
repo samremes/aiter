@@ -16,6 +16,7 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     SUPPORTED_K,
     WORKGROUPS_PER_CU,
     launch_fp8_paged_mqa_local_topk,
+    should_xcd_row_fast,
 )
 from .split_topk_merge import (
     persistent_merge_parts,
@@ -210,6 +211,21 @@ def _auto_num_splits(
     return _plan_num_splits(rows, max_history, k, cu_count)
 
 
+def _resolve_xcd_row_fast(
+    xcd_row_fast,
+    indices,
+    q_fp8,
+    row_requests,
+    row_context_lens,
+    num_splits: int,
+) -> bool:
+    if xcd_row_fast is not None:
+        return bool(xcd_row_fast)
+    if indices is None:
+        return int(q_fp8.shape[1]) > 1 and int(num_splits) % NUM_XCD == 0
+    return should_xcd_row_fast(row_requests, row_context_lens, num_splits)
+
+
 def flydsl_fp8_paged_mqa_local_topk(
     q_fp8,
     kv_cache,
@@ -222,6 +238,7 @@ def flydsl_fp8_paged_mqa_local_topk(
     num_splits=None,
     preshuffled=False,
     indices=None,
+    xcd_row_fast=None,
 ):
     """Compute exact H32D128 FP8 scores and retain local TopK per history split.
 
@@ -239,6 +256,10 @@ def flydsl_fp8_paged_mqa_local_topk(
     they load no KV and emit ``(-inf, -1)``. Live ``indices`` entries must be
     valid ``block_tables`` rows; unlike block-table page ids they are not
     range-checked on device.
+
+    When consecutive live rows share a request, the grid walks those siblings
+    back-to-back on the split's XCD. ``next_n=1`` stays on the identity walk.
+    Pass ``xcd_row_fast`` to force either order.
 
     Row lengths larger than ``block_tables.shape[1] * page_size`` are clamped
     to that table span. Block-table entries outside ``[0, num_pages)`` are not
@@ -326,6 +347,9 @@ def flydsl_fp8_paged_mqa_local_topk(
         (rows, num_splits, k), dtype=torch.int32, device=device
     )
     candidate_counts = torch.empty((rows, num_splits), dtype=torch.int32, device=device)
+    xcd_row_fast = _resolve_xcd_row_fast(
+        xcd_row_fast, indices, q_fp8, row_requests, row_context_lens, num_splits
+    )
 
     stream = torch.cuda.current_stream(device)
     with torch.cuda.device(device):
@@ -346,6 +370,7 @@ def flydsl_fp8_paged_mqa_local_topk(
             arch=arch,
             stream=stream,
             packed=packed,
+            xcd_row_fast=xcd_row_fast,
         )
     return candidate_scores, candidate_positions, candidate_counts
 
@@ -362,6 +387,7 @@ def flydsl_fp8_paged_mqa_topk(
     num_splits=None,
     persistent_merge=False,
     indices=None,
+    xcd_row_fast=None,
 ):
     """Compute exact TopK through compact split-local candidate bags.
 
@@ -472,6 +498,9 @@ def flydsl_fp8_paged_mqa_topk(
             workspace = persistent_split_topk_merge_views(flat_workspace, rows)
         else:
             workspace = split_topk_merge_workspace(device, rows)
+    xcd_row_fast = _resolve_xcd_row_fast(
+        xcd_row_fast, indices, q_fp8, row_requests, row_context_lens, num_splits
+    )
     stream = torch.cuda.current_stream(device)
     with torch.cuda.device(device):
         launch_fp8_paged_mqa_local_topk(
@@ -497,6 +526,7 @@ def flydsl_fp8_paged_mqa_topk(
             ordered_emit=False,
             restore_merge_workspace=use_persistent,
             merge_workspace=flat_workspace,
+            xcd_row_fast=xcd_row_fast,
         )
         if workspace is None:
             values = candidate_scores[:, 0]

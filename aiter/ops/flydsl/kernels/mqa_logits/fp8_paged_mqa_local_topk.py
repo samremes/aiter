@@ -52,6 +52,35 @@ WORKGROUPS_PER_CU = 16 // PROFILE_WAVES
 SUPPORTED_K = (128, 512, 1024, 2048)
 
 
+def map_workgroup_to_split_row(
+    bx: int, by: int, num_splits: int, rows: int, *, row_fast: bool
+) -> tuple[int, int]:
+    """Host image of the kernel XCD walk. Identity unless ``row_fast`` and S%8==0."""
+    if not row_fast or num_splits % NUM_XCD:
+        return bx, by
+    lid = bx + num_splits * by
+    xcd = lid % NUM_XCD
+    k = lid // NUM_XCD
+    return (k // rows) * NUM_XCD + xcd, k % rows
+
+
+def should_xcd_row_fast(row_requests, context_lens, num_splits: int) -> bool:
+    """True when packed live siblings exist and splits stripe evenly across XCDs.
+
+    Consecutive equal ``indices`` among live rows means some request speculated
+    more than one token. ``next_n=1`` has no such pair and stays on the
+    identity grid, which is the faster spine walk.
+    """
+    if int(num_splits) % NUM_XCD:
+        return False
+    rows = int(row_requests.numel())
+    if rows < 2:
+        return False
+    live = context_lens.reshape(-1) > 0
+    sibling = row_requests[:-1] == row_requests[1:]
+    return bool((sibling & live[:-1] & live[1:]).any().item())
+
+
 def fp8_paged_mqa_local_topk_kernel_name(
     *,
     topk: int,
@@ -244,14 +273,31 @@ def compile_fp8_paged_mqa_local_topk(
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
         merge_workspace: fx.Tensor,
+        rows: fx.Int32,
         num_splits: fx.Int32,
+        xcd_row_fast: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
     ):
         page_size_i32 = fx.Int32(page_size)
         tid = fx.Int32(gpu.thread_idx.x)
-        split = fx.Int32(gpu.block_idx.x)
-        row = fx.Int32(gpu.block_idx.y)
+        # Identity grid is (split, row): XCD = split mod 8, but each XCD
+        # finishes every split of row 0 before row 1 asks for the same split.
+        # When packed live siblings exist, walk row fastest on that XCD so
+        # MTP rows of one split share L2 back-to-back. next_n=1 stays identity
+        # (consecutive rows are different requests; row-fast churns unique
+        # page sets). Host sets xcd_row_fast; S must still be a multiple of 8.
+        bx = fx.Int32(gpu.block_idx.x)
+        by = fx.Int32(gpu.block_idx.y)
+        lid = bx + num_splits * by
+        xcd = _umod(lid, fx.Int32(NUM_XCD))
+        k = _udiv(lid, fx.Int32(NUM_XCD))
+        mapped_row = _umod(k, rows)
+        mapped_split = _udiv(k, rows) * fx.Int32(NUM_XCD) + xcd
+        aligned = _umod(num_splits, fx.Int32(NUM_XCD)) == 0
+        use_map = aligned & (xcd_row_fast != 0)
+        split = use_map.select(mapped_split, bx)
+        row = use_map.select(mapped_row, by)
         wave = _udiv(tid, WAVE_SIZE)
         lane = _umod(tid, WAVE_SIZE)
         lane_div_16 = _udiv(lane, MFMA_N)
@@ -802,6 +848,7 @@ def compile_fp8_paged_mqa_local_topk(
         merge_workspace: fx.Tensor,
         rows: fx.Int32,
         num_splits: fx.Int32,
+        xcd_row_fast: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
         stream: fx.Stream,
@@ -822,7 +869,9 @@ def compile_fp8_paged_mqa_local_topk(
             merge_histogram,
             merge_state,
             merge_workspace,
+            rows,
             num_splits,
+            xcd_row_fast,
             max_pages,
             num_pages,
         ).launch(grid=(gx, gy, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
@@ -855,9 +904,12 @@ def launch_fp8_paged_mqa_local_topk(
     ordered_emit=True,
     restore_merge_workspace=False,
     merge_workspace=None,
+    xcd_row_fast=None,
 ):
     page_size = kv_cache.shape[1]
     rows = row_requests.numel()
+    if xcd_row_fast is None:
+        xcd_row_fast = should_xcd_row_fast(row_requests, context_lens, num_splits)
     launcher = compile_fp8_paged_mqa_local_topk(
         topk=topk,
         arch=arch,
@@ -893,6 +945,7 @@ def launch_fp8_paged_mqa_local_topk(
         merge_workspace,
         rows,
         num_splits,
+        int(xcd_row_fast),
         max_pages,
         num_pages,
         stream,

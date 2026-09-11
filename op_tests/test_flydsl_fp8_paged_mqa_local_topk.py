@@ -26,6 +26,11 @@ from aiter.ops.flydsl.fp8_paged_mqa_local_topk import (
     _plan_num_splits,
     merge_local_topk_candidates,
 )
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_local_topk import (
+    NUM_XCD,
+    map_workgroup_to_split_row,
+    should_xcd_row_fast,
+)
 from aiter.ops.flydsl.split_topk_merge import (
     clear_split_topk_merge_workspace_cache,
     multisequence_sorted_split_topk_merge,
@@ -623,6 +628,70 @@ def test_auto_split_plan():
     assert _plan_num_splits(16, length, k, cu_count) == 32
     assert _plan_num_splits(32, length, k, cu_count) == 32
     assert _plan_num_splits(1, 4096, k, cu_count) == 2
+
+
+def test_xcd_row_fast_is_a_permutation_and_auto_skips_next_n_1():
+    for num_splits, rows, row_fast in (
+        (64, 8, True),
+        (32, 16, True),
+        (4, 12, True),
+        (32, 16, False),
+    ):
+        seen = set()
+        for by in range(rows):
+            for bx in range(num_splits):
+                split, row = map_workgroup_to_split_row(
+                    bx, by, num_splits, rows, row_fast=row_fast
+                )
+                assert 0 <= split < num_splits
+                assert 0 <= row < rows
+                seen.add((split, row))
+        assert seen == {(s, r) for s in range(num_splits) for r in range(rows)}
+        if row_fast and num_splits % NUM_XCD == 0:
+            order = []
+            for lid in range(0, num_splits * rows, NUM_XCD):
+                bx = lid % num_splits
+                by = lid // num_splits
+                order.append(
+                    map_workgroup_to_split_row(
+                        bx, by, num_splits, rows, row_fast=True
+                    )
+                )
+            assert order[:rows] == [(0, r) for r in range(rows)]
+
+    n1_idx = torch.arange(8, dtype=torch.int32)
+    n1_len = torch.full((8,), 128, dtype=torch.int32)
+    assert should_xcd_row_fast(n1_idx, n1_len, 64) is False
+    n2_idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.int32)
+    n2_len = torch.full((8,), 128, dtype=torch.int32)
+    assert should_xcd_row_fast(n2_idx, n2_len, 32) is True
+    padded = torch.tensor([0, 1, 2, 3, 0, 0], dtype=torch.int32)
+    padded_len = torch.tensor([128, 128, 128, 128, 0, 0], dtype=torch.int32)
+    assert should_xcd_row_fast(padded, padded_len, 32) is False
+
+
+def test_xcd_row_fast_matches_identity_sets():
+    _require_supported_gpu()
+    rows, length, k, splits = 4, 8193, 128, 8
+    case = _make_case(rows, length, 64, seed=67, next_n=2)
+    kv = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    common = dict(
+        q_fp8=case.q,
+        kv_cache=kv,
+        k_scales=None,
+        weights=case.weights,
+        context_lens=case.lengths,
+        block_tables=case.block_tables,
+        k=k,
+        num_splits=splits,
+        preshuffled=True,
+    )
+    identity = flydsl_fp8_paged_mqa_local_topk(**common, xcd_row_fast=False)
+    remapped = flydsl_fp8_paged_mqa_local_topk(**common, xcd_row_fast=True)
+    for row in range(rows):
+        assert _row_candidate_set(*identity, row) == _row_candidate_set(
+            *remapped, row
+        )
 
 
 def _row_candidate_set(scores, positions, counts, row):
