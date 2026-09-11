@@ -49,6 +49,121 @@ class Case:
     weights: torch.Tensor
     lengths: torch.Tensor
     block_tables: torch.Tensor
+    indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    decode_lens: torch.Tensor
+
+
+@dataclass
+class PackedCase:
+    q: torch.Tensor
+    kv: torch.Tensor
+    scales: torch.Tensor
+    weights: torch.Tensor
+    lengths: torch.Tensor
+    block_tables: torch.Tensor
+    indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    decode_lens: torch.Tensor
+
+
+def _make_packed_case(
+    decode_lens,
+    length,
+    page_size,
+    *,
+    seed=17,
+    independent_kv=False,
+    context_len=None,
+):
+    decode_lens_cpu = torch.as_tensor(decode_lens, dtype=torch.int32, device="cpu")
+    if decode_lens_cpu.ndim != 1 or decode_lens_cpu.numel() == 0:
+        raise ValueError("decode_lens must be a non-empty 1D sequence")
+    if torch.any(decode_lens_cpu < 1):
+        raise ValueError("decode_lens entries must be positive")
+
+    batch = decode_lens_cpu.numel()
+    rows = int(decode_lens_cpu.sum().item())
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    if context_len is None:
+        context_len = length
+    if context_len < int(decode_lens_cpu.max()) or context_len > length:
+        raise ValueError("context_len must be in [max(decode_lens), length]")
+
+    context_pages = max(1, (context_len + page_size - 1) // page_size)
+    table_pages = max(1, (length + page_size - 1) // page_size)
+    q = (
+        torch.randn(
+            rows,
+            1,
+            HEADS,
+            HEAD_DIM,
+            device=device,
+            generator=generator,
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    pages = batch * context_pages if independent_kv else context_pages
+    kv = (
+        torch.randn(pages, page_size, HEAD_DIM, device=device, generator=generator)
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    scales = torch.rand(
+        pages, page_size, device=device, generator=generator, dtype=torch.float32
+    )
+    weights = torch.randn(
+        rows, HEADS, device=device, generator=generator, dtype=torch.float32
+    )
+
+    decode_lens = decode_lens_cpu.to(device)
+    query_start_loc = torch.empty(batch + 1, device=device, dtype=torch.int32)
+    query_start_loc[0] = 0
+    torch.cumsum(decode_lens, dim=0, out=query_start_loc[1:])
+    indices = torch.repeat_interleave(
+        torch.arange(batch, device=device, dtype=torch.int32),
+        decode_lens,
+        output_size=rows,
+    )
+    lengths = torch.cat(
+        [
+            torch.arange(
+                context_len - int(n) + 1,
+                context_len + 1,
+                device=device,
+                dtype=torch.int32,
+            )
+            for n in decode_lens_cpu.tolist()
+        ]
+    )
+
+    block_tables = torch.zeros(
+        (batch, table_pages), device=device, dtype=torch.int32
+    )
+    if independent_kv:
+        for req in range(batch):
+            origin = req * context_pages
+            perm = torch.randperm(
+                context_pages, device=device, generator=generator
+            )
+            block_tables[req, :context_pages] = (perm + origin).to(torch.int32)
+    else:
+        physical_order = torch.randperm(
+            context_pages, device=device, generator=generator
+        )
+        block_tables[:, :context_pages] = physical_order.to(torch.int32)
+
+    return PackedCase(
+        q,
+        kv,
+        scales,
+        weights,
+        lengths,
+        block_tables,
+        indices,
+        query_start_loc,
+        decode_lens,
+    )
 
 
 def _require_supported_gpu():
@@ -75,73 +190,31 @@ def _make_case(
     if rows % next_n:
         raise ValueError("rows must be divisible by next_n")
     batch = rows // next_n
-    device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(seed)
-    if context_len is None:
-        context_len = length
-    if context_len < 1 or context_len > length:
-        raise ValueError("context_len must be in [1, length]")
-    context_pages = max(1, (context_len + page_size - 1) // page_size)
-    table_pages = max(1, (length + page_size - 1) // page_size)
-    q = (
-        torch.randn(
-            batch,
-            next_n,
-            HEADS,
-            HEAD_DIM,
-            device=device,
-            generator=generator,
-        )
-        * 0.25
-    ).to(torch.float8_e4m3fn)
-    pages = batch * context_pages if independent_kv else context_pages
-    kv = (
-        torch.randn(pages, page_size, HEAD_DIM, device=device, generator=generator)
-        * 0.25
-    ).to(torch.float8_e4m3fn)
-    scales = torch.rand(
-        pages, page_size, device=device, generator=generator, dtype=torch.float32
+    packed = _make_packed_case(
+        [next_n] * batch,
+        length,
+        page_size,
+        seed=seed,
+        independent_kv=independent_kv,
+        context_len=context_len,
     )
-    weights = torch.randn(
-        rows, HEADS, device=device, generator=generator, dtype=torch.float32
-    )
-    lengths = torch.full((rows,), context_len, device=device, dtype=torch.int32)
-    if next_n > 1:
-        causal_offsets = torch.arange(
-            1 - next_n,
-            1,
-            device=device,
-            dtype=torch.int32,
-        )
-        lengths = (
-            torch.full(
-                (batch, next_n),
-                context_len,
-                device=device,
-                dtype=torch.int32,
-            )
-            + causal_offsets
-        ).clamp_min_(0)
+    q = packed.q.view(batch, next_n, HEADS, HEAD_DIM)
+    lengths = packed.lengths.view(batch, next_n) if next_n > 1 else packed.lengths
     if ragged and rows > 1:
         flat_lengths = lengths.reshape(-1)
         flat_lengths[0] = 0
-        flat_lengths[-1] = max(0, context_len - 3)
-    block_tables = torch.zeros(
-        (batch, table_pages), device=device, dtype=torch.int32
+        flat_lengths[-1] = max(0, int(packed.lengths[-1]) - 3)
+    return Case(
+        q,
+        packed.kv,
+        packed.scales,
+        packed.weights,
+        lengths,
+        packed.block_tables,
+        packed.indices,
+        packed.query_start_loc,
+        packed.decode_lens,
     )
-    if independent_kv:
-        for req in range(batch):
-            origin = req * context_pages
-            perm = torch.randperm(
-                context_pages, device=device, generator=generator
-            )
-            block_tables[req, :context_pages] = (perm + origin).to(torch.int32)
-    else:
-        physical_order = torch.randperm(
-            context_pages, device=device, generator=generator
-        )
-        block_tables[:, :context_pages] = physical_order.to(torch.int32)
-    return Case(q, kv, scales, weights, lengths, block_tables)
 
 
 def _preshuffle_kv(kv):
@@ -162,8 +235,7 @@ def _pack_kv(kv, scales):
 
 def run_torch(case):
     """Independent FP32 oracle with explicit page mapping and epilogue order."""
-    batch, next_n = case.q.shape[:2]
-    rows = batch * next_n
+    rows = case.weights.shape[0]
     q = case.q.reshape(rows, HEADS, HEAD_DIM)
     lengths = case.lengths.reshape(-1)
     page_size = case.kv.shape[1]
@@ -174,7 +246,7 @@ def run_torch(case):
         length = int(lengths[row].item())
         logical = torch.arange(length, device=case.q.device)
         physical = (
-            case.block_tables[row // next_n, logical // page_size] * page_size
+            case.block_tables[int(case.indices[row]), logical // page_size] * page_size
             + logical % page_size
         )
         keys = flat_kv[physical]
