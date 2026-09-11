@@ -563,12 +563,17 @@ def compile_fp8_paged_mqa_local_topk(
                     )
                     frag = fx.Vector(acc)
                     for ii in range_constexpr(DREG):
-                        scaled = fx.Float32(frag[ii]) * scale
-                        activated = scaled.maximumf(fx.Float32(0.0))
+                        activated = fx.Float32(frag[ii]).maximumf(fx.Float32(0.0))
                         weight = weight_frags[mi][ii]
                         total = total + activated * weight
                 total = total + total.shuffle_xor(16, WAVE_SIZE)
                 total = total + total.shuffle_xor(32, WAVE_SIZE)
+                # `scale` is per position: it is the same for all DREG heads in a
+                # lane and across both shuffle_xor lane groups, so it factors out
+                # of the ReLU sum. Clamping it to >= 0 keeps that exact, since a
+                # negative or NaN scale must score 0 (previously supplied by
+                # maximumf on each scaled product).
+                total = total * scale.maximumf(fx.Float32(0.0))
                 total = page_oks[ni].select(total, fx.Float32(float("-inf")))
 
                 is_writer = (lane_div_16 == 0) & (logical < split_end)

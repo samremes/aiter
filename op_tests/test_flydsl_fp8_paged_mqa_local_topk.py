@@ -94,8 +94,12 @@ def _make_packed_case(
     generator = torch.Generator(device=device).manual_seed(seed)
     if context_len is None:
         context_len = length
-    if context_len < int(decode_lens_cpu.max()) or context_len > length:
-        raise ValueError("context_len must be in [max(decode_lens), length]")
+    if context_len > length:
+        raise ValueError("context_len must not exceed length")
+    if context_len + 1 < int(decode_lens_cpu.max()):
+        # Row j of a request gets causal length context_len - n + j + 1, so the
+        # shortest sibling only stays non-negative while n <= context_len + 1.
+        raise ValueError("context_len leaves a speculated row a negative length")
 
     context_pages = max(1, (context_len + page_size - 1) // page_size)
     table_pages = max(1, (length + page_size - 1) // page_size)
