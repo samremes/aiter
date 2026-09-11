@@ -236,6 +236,7 @@ def compile_fp8_paged_mqa_local_topk(
         k_scales: fx.Tensor,
         weights: fx.Tensor,
         context_lens: fx.Tensor,
+        row_requests: fx.Tensor,
         block_tables: fx.Tensor,
         candidate_scores: fx.Tensor,
         candidate_positions: fx.Tensor,
@@ -243,7 +244,6 @@ def compile_fp8_paged_mqa_local_topk(
         merge_histogram: fx.Tensor,
         merge_state: fx.Tensor,
         merge_workspace: fx.Tensor,
-        next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
@@ -262,6 +262,7 @@ def compile_fp8_paged_mqa_local_topk(
         scales = GTensor(k_scales, dtype=T.f32, shape=(-1,))
         weight_t = GTensor(weights, dtype=T.f32, shape=(-1, HEADS))
         lengths = GTensor(context_lens, dtype=T.i32, shape=(-1,))
+        requests = GTensor(row_requests, dtype=T.i32, shape=(-1,))
         tables = GTensor(block_tables, dtype=T.i32, shape=(-1,))
 
         storage = fx.SharedAllocator().allocate(storage_type)
@@ -281,7 +282,10 @@ def compile_fp8_paged_mqa_local_topk(
             valid_len * (split + fx.Int32(1)),
             num_splits,
         )
-        request = _udiv(row, next_n)
+        # Rows are packed, not a [batch, next_n] rectangle: each row carries the
+        # request whose pages it scores. A dead graph slot has length 0, so its
+        # split is empty, it loads no K, and the emit path fills (-inf, -1).
+        request = fx.Int32(requests[row])
 
         if tid == 0:
             state[_RETAINED] = 0
@@ -788,6 +792,7 @@ def compile_fp8_paged_mqa_local_topk(
         k_scales: fx.Tensor,
         weights: fx.Tensor,
         context_lens: fx.Tensor,
+        row_requests: fx.Tensor,
         block_tables: fx.Tensor,
         candidate_scores: fx.Tensor,
         candidate_positions: fx.Tensor,
@@ -796,7 +801,6 @@ def compile_fp8_paged_mqa_local_topk(
         merge_state: fx.Tensor,
         merge_workspace: fx.Tensor,
         rows: fx.Int32,
-        next_n: fx.Int32,
         num_splits: fx.Int32,
         max_pages: fx.Int32,
         num_pages: fx.Int32,
@@ -810,6 +814,7 @@ def compile_fp8_paged_mqa_local_topk(
             k_scales,
             weights,
             context_lens,
+            row_requests,
             block_tables,
             candidate_scores,
             candidate_positions,
@@ -817,7 +822,6 @@ def compile_fp8_paged_mqa_local_topk(
             merge_histogram,
             merge_state,
             merge_workspace,
-            next_n,
             num_splits,
             max_pages,
             num_pages,
@@ -833,6 +837,7 @@ def launch_fp8_paged_mqa_local_topk(
     k_scales,
     weights,
     context_lens,
+    row_requests,
     block_tables,
     candidate_scores,
     candidate_positions,
@@ -852,8 +857,7 @@ def launch_fp8_paged_mqa_local_topk(
     merge_workspace=None,
 ):
     page_size = kv_cache.shape[1]
-    batch, next_n, _, _ = q_fp8.shape
-    rows = batch * next_n
+    rows = row_requests.numel()
     launcher = compile_fp8_paged_mqa_local_topk(
         topk=topk,
         arch=arch,
@@ -879,6 +883,7 @@ def launch_fp8_paged_mqa_local_topk(
         k_scales,
         weights,
         context_lens,
+        row_requests,
         block_tables,
         candidate_scores,
         candidate_positions,
@@ -887,7 +892,6 @@ def launch_fp8_paged_mqa_local_topk(
         merge_state,
         merge_workspace,
         rows,
-        next_n,
         num_splits,
         max_pages,
         num_pages,

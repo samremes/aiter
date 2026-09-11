@@ -625,6 +625,90 @@ def test_auto_split_plan():
     assert _plan_num_splits(1, 4096, k, cu_count) == 2
 
 
+def _row_candidate_set(scores, positions, counts, row):
+    """Collect one row's live (position, score) pairs across all its splits.
+
+    Split-local emission order and the tie order within a split are both
+    unspecified, so equality between two launches is set equality, not
+    elementwise.
+    """
+    pairs = set()
+    for split in range(scores.shape[1]):
+        live = int(counts[row, split])
+        for slot in range(live):
+            position = int(positions[row, split, slot])
+            assert position >= 0
+            pairs.add((position, float(scores[row, split, slot])))
+    return pairs
+
+
+def test_packed_mixed_next_n_matches_uniform_launches():
+    """A packed mixed-width launch equals the uniform launches it replaces.
+
+    Four requests speculate two tokens and four speculate one. Serving cannot
+    express that as a [batch, next_n] rectangle, and padding it to next_n=2
+    would score four rows that do not exist. The packed launch must return
+    exactly what two separate uniform launches return, and must leave the dead
+    graph slots empty.
+    """
+    _require_supported_gpu()
+    length, k, splits = 8193, 128, 4
+    case = _make_packed_case(
+        [2, 2, 2, 2, 1, 1, 1, 1],
+        length,
+        64,
+        seed=61,
+        independent_kv=True,
+        r_max=16,
+    )
+    kv = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    common = dict(k=k, num_splits=splits, preshuffled=True)
+
+    packed_scores, packed_positions, packed_counts = flydsl_fp8_paged_mqa_local_topk(
+        case.q,
+        kv,
+        None,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        indices=case.indices,
+        **common,
+    )
+
+    # The same rows, launched the only way the rectangle ABI can express them:
+    # requests 0-3 as a [4,2] launch, then requests 4-7 as a [4,1] launch.
+    uniform = []
+    for row0, row1, request0, request1, next_n in ((0, 8, 0, 4, 2), (8, 12, 4, 8, 1)):
+        group_rows = row1 - row0
+        uniform.append(
+            flydsl_fp8_paged_mqa_local_topk(
+                case.q[row0:row1].reshape(
+                    group_rows // next_n, next_n, HEADS, HEAD_DIM
+                ),
+                kv,
+                None,
+                case.weights[row0:row1].contiguous(),
+                case.lengths[row0:row1].reshape(group_rows // next_n, next_n),
+                case.block_tables[request0:request1].contiguous(),
+                **common,
+            )
+        )
+
+    for row in range(case.live_rows):
+        group = 0 if row < 8 else 1
+        group_row = row if group == 0 else row - 8
+        assert _row_candidate_set(
+            packed_scores, packed_positions, packed_counts, row
+        ) == _row_candidate_set(*uniform[group], group_row), f"row {row} differs"
+
+    dead = case.q.shape[0] - case.live_rows
+    assert dead == 4
+    for row in range(case.live_rows, case.q.shape[0]):
+        assert int(packed_counts[row].sum()) == 0
+        assert torch.all(torch.isneginf(packed_scores[row]))
+        assert torch.all(packed_positions[row] == -1)
+
+
 def test_packed_adaptive_harness_layout():
     _require_supported_gpu()
     case = _make_packed_case(

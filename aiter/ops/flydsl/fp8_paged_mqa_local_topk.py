@@ -117,6 +117,66 @@ def _normalize_context_lens(
     )
 
 
+@lru_cache(maxsize=32)
+def _rectangle_row_requests(
+    device_type: str, device_index: int, batch: int, next_n: int
+) -> torch.Tensor:
+    device = torch.device(device_type, device_index)
+    return torch.arange(batch, dtype=torch.int32, device=device).repeat_interleave(
+        next_n
+    )
+
+
+def _normalize_row_requests(
+    q_fp8: torch.Tensor,
+    indices: torch.Tensor | None,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Resolve per-row request ids and per-row causal lengths.
+
+    With ``indices`` the rows are packed: speculated widths may differ per
+    request and trailing rows may be dead graph slots, which the kernel
+    recognizes by a zero length. Without it the rows are the legacy
+    ``[batch, next_n]`` rectangle and the ids are ``row // next_n``.
+    """
+    num_requests = int(block_tables.shape[0])
+    if indices is None:
+        batch, next_n = int(q_fp8.shape[0]), int(q_fp8.shape[1])
+        if batch != num_requests:
+            raise ValueError(
+                f"block_tables must have one row per request; got {num_requests} "
+                f"for a [{batch},{next_n}] query. Pass indices for packed rows."
+            )
+        device = q_fp8.device
+        row_requests = _rectangle_row_requests(
+            device.type,
+            device.index if device.index is not None else torch.cuda.current_device(),
+            batch,
+            next_n,
+        )
+        return row_requests, _normalize_context_lens(context_lens, batch, next_n), batch
+
+    _require_cuda_contiguous("indices", indices)
+    if indices.ndim != 1 or indices.dtype != torch.int32:
+        raise ValueError(
+            f"indices must be contiguous int32 [rows], got "
+            f"{tuple(indices.shape)} {indices.dtype}"
+        )
+    rows = int(indices.numel())
+    if q_fp8.shape[0] * q_fp8.shape[1] != rows:
+        raise ValueError(
+            f"packed q_fp8 must hold {rows} rows to match indices, got "
+            f"{tuple(q_fp8.shape)}"
+        )
+    if context_lens.shape != (rows,):
+        raise ValueError(
+            "packed context_lens must be per row with shape "
+            f"{(rows,)}, got {tuple(context_lens.shape)}"
+        )
+    return indices, context_lens, num_requests
+
+
 _MAX_AUTO_SPLIT_SPAN = 32768
 
 
@@ -141,8 +201,11 @@ def _plan_num_splits(rows: int, max_history: int, k: int, cu_count: int) -> int:
     return aligned
 
 
-def _auto_num_splits(q_fp8: torch.Tensor, max_history: int, k: int) -> int:
-    rows = q_fp8.shape[0] * q_fp8.shape[1]
+def _auto_num_splits(
+    q_fp8: torch.Tensor, max_history: int, k: int, rows: int | None = None
+) -> int:
+    if rows is None:
+        rows = q_fp8.shape[0] * q_fp8.shape[1]
     cu_count = torch.cuda.get_device_properties(q_fp8.device).multi_processor_count
     return _plan_num_splits(rows, max_history, k, cu_count)
 
@@ -158,6 +221,7 @@ def flydsl_fp8_paged_mqa_local_topk(
     k=2048,
     num_splits=None,
     preshuffled=False,
+    indices=None,
 ):
     """Compute exact H32D128 FP8 scores and retain local TopK per history split.
 
@@ -166,6 +230,15 @@ def flydsl_fp8_paged_mqa_local_topk(
     Set ``preshuffled=True`` when ``kv_cache`` uses
     ``shuffle_weight(..., layout=(16,16))`` within each page. This experimental
     API never allocates a full-width logits tensor.
+
+    Rows are either a ``[batch, next_n]`` rectangle of uniformly speculated
+    requests, or -- passing ``indices`` -- packed rows where speculated widths
+    differ per request. Packed ``indices[r]`` is the request that row ``r``
+    scores, and ``context_lens`` must then be per row. Trailing rows may be
+    dead graph slots, held at length 0 so the launch shape can stay static:
+    they load no KV and emit ``(-inf, -1)``. Live ``indices`` entries must be
+    valid ``block_tables`` rows; unlike block-table page ids they are not
+    range-checked on device.
 
     Row lengths larger than ``block_tables.shape[1] * page_size`` are clamped
     to that table span. Block-table entries outside ``[0, num_pages)`` are not
@@ -211,8 +284,7 @@ def flydsl_fp8_paged_mqa_local_topk(
     if not isinstance(preshuffled, bool):
         raise TypeError(f"preshuffled must be bool, got {type(preshuffled).__name__}")
 
-    batch, next_n, _, _ = q_fp8.shape
-    rows = batch * next_n
+    rows = q_fp8.shape[0] * q_fp8.shape[1]
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
         raise ValueError(
             f"weights must be contiguous float32 with shape {(rows, 32)}, "
@@ -220,15 +292,14 @@ def flydsl_fp8_paged_mqa_local_topk(
         )
     if context_lens.dtype != torch.int32:
         raise ValueError(f"context_lens must be int32, got {context_lens.dtype}")
-    if (
-        block_tables.ndim != 2
-        or block_tables.shape[0] != batch
-        or block_tables.dtype != torch.int32
-    ):
+    if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
         raise ValueError(
             f"block_tables must be contiguous int32 [B,max_pages], got "
             f"{tuple(block_tables.shape)} {block_tables.dtype}"
         )
+    row_requests, row_context_lens, _ = _normalize_row_requests(
+        q_fp8, indices, context_lens, block_tables
+    )
     if k not in SUPPORTED_K:
         raise ValueError(f"k must be one of {SUPPORTED_K}, got {k}")
 
@@ -238,7 +309,7 @@ def flydsl_fp8_paged_mqa_local_topk(
             f"preshuffled kv_cache requires page_size divisible by 16, got {page_size}"
         )
     if num_splits is None:
-        num_splits = _auto_num_splits(q_fp8, max_history, k)
+        num_splits = _auto_num_splits(q_fp8, max_history, k, rows)
     if not isinstance(num_splits, int) or num_splits <= 0:
         raise ValueError(f"num_splits must be a positive integer, got {num_splits}")
     max_split_span = (max_history + num_splits - 1) // num_splits
@@ -248,7 +319,6 @@ def flydsl_fp8_paged_mqa_local_topk(
             f"uint16 local-position reservoir; got at most {max_split_span}"
         )
 
-    row_context_lens = _normalize_context_lens(context_lens, batch, next_n)
     candidate_scores = torch.empty(
         (rows, num_splits, k), dtype=torch.float32, device=device
     )
@@ -265,6 +335,7 @@ def flydsl_fp8_paged_mqa_local_topk(
             k_scales,
             weights,
             row_context_lens,
+            row_requests,
             block_tables,
             candidate_scores,
             candidate_positions,
@@ -290,11 +361,13 @@ def flydsl_fp8_paged_mqa_topk(
     k=2048,
     num_splits=None,
     persistent_merge=False,
+    indices=None,
 ):
     """Compute exact TopK through compact split-local candidate bags.
 
-    Packed pages may pass ``k_scales=None``. Lengths and block-table ids follow
-    the same safety contract as ``flydsl_fp8_paged_mqa_local_topk``.
+    Packed pages may pass ``k_scales=None``. Lengths, ``indices`` and
+    block-table ids follow the same contract as
+    ``flydsl_fp8_paged_mqa_local_topk``.
     """
     for name, tensor in (
         ("q_fp8", q_fp8),
@@ -348,24 +421,18 @@ def flydsl_fp8_paged_mqa_topk(
         raise ValueError(f"weights must be float32 with shape {(rows, 32)}")
     if context_lens.dtype != torch.int32:
         raise ValueError(f"context_lens must be int32, got {context_lens.dtype}")
-    if (
-        block_tables.ndim != 2
-        or block_tables.shape[0] != batch
-        or block_tables.dtype != torch.int32
-    ):
+    if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
         raise ValueError("block_tables must be int32 [B,max_pages]")
     if k not in SUPPORTED_K:
         raise ValueError(f"k must be one of {SUPPORTED_K}, got {k}")
 
     arch = _arch_name(device)
-    row_context_lens = _normalize_context_lens(
-        context_lens,
-        batch,
-        next_n,
+    row_requests, row_context_lens, _ = _normalize_row_requests(
+        q_fp8, indices, context_lens, block_tables
     )
     max_history = block_tables.shape[1] * 64
     if num_splits is None:
-        num_splits = _auto_num_splits(q_fp8, max_history, k)
+        num_splits = _auto_num_splits(q_fp8, max_history, k, rows)
     if not isinstance(num_splits, int) or num_splits <= 0:
         raise ValueError(f"num_splits must be a positive integer, got {num_splits}")
     max_split_span = (max_history + num_splits - 1) // num_splits
@@ -413,6 +480,7 @@ def flydsl_fp8_paged_mqa_topk(
             k_scales,
             weights,
             row_context_lens,
+            row_requests,
             block_tables,
             candidate_scores,
             candidate_positions,
