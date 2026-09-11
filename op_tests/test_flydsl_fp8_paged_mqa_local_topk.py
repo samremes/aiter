@@ -65,6 +65,7 @@ class PackedCase:
     indices: torch.Tensor
     query_start_loc: torch.Tensor
     decode_lens: torch.Tensor
+    live_rows: int
 
 
 def _make_packed_case(
@@ -75,6 +76,7 @@ def _make_packed_case(
     seed=17,
     independent_kv=False,
     context_len=None,
+    r_max=None,
 ):
     decode_lens_cpu = torch.as_tensor(decode_lens, dtype=torch.int32, device="cpu")
     if decode_lens_cpu.ndim != 1 or decode_lens_cpu.numel() == 0:
@@ -83,7 +85,11 @@ def _make_packed_case(
         raise ValueError("decode_lens entries must be positive")
 
     batch = decode_lens_cpu.numel()
-    rows = int(decode_lens_cpu.sum().item())
+    live_rows = int(decode_lens_cpu.sum().item())
+    if r_max is None:
+        r_max = live_rows
+    if r_max < live_rows:
+        raise ValueError("r_max must be at least sum(decode_lens)")
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     if context_len is None:
@@ -95,7 +101,7 @@ def _make_packed_case(
     table_pages = max(1, (length + page_size - 1) // page_size)
     q = (
         torch.randn(
-            rows,
+            r_max,
             1,
             HEADS,
             HEAD_DIM,
@@ -113,19 +119,21 @@ def _make_packed_case(
         pages, page_size, device=device, generator=generator, dtype=torch.float32
     )
     weights = torch.randn(
-        rows, HEADS, device=device, generator=generator, dtype=torch.float32
+        r_max, HEADS, device=device, generator=generator, dtype=torch.float32
     )
 
     decode_lens = decode_lens_cpu.to(device)
     query_start_loc = torch.empty(batch + 1, device=device, dtype=torch.int32)
     query_start_loc[0] = 0
     torch.cumsum(decode_lens, dim=0, out=query_start_loc[1:])
-    indices = torch.repeat_interleave(
+    live_indices = torch.repeat_interleave(
         torch.arange(batch, device=device, dtype=torch.int32),
         decode_lens,
-        output_size=rows,
+        output_size=live_rows,
     )
-    lengths = torch.cat(
+    indices = torch.zeros(r_max, device=device, dtype=torch.int32)
+    indices[:live_rows] = live_indices
+    live_lengths = torch.cat(
         [
             torch.arange(
                 context_len - int(n) + 1,
@@ -136,6 +144,8 @@ def _make_packed_case(
             for n in decode_lens_cpu.tolist()
         ]
     )
+    lengths = torch.zeros(r_max, device=device, dtype=torch.int32)
+    lengths[:live_rows] = live_lengths
 
     block_tables = torch.zeros(
         (batch, table_pages), device=device, dtype=torch.int32
@@ -163,6 +173,7 @@ def _make_packed_case(
         indices,
         query_start_loc,
         decode_lens,
+        live_rows,
     )
 
 
@@ -608,6 +619,60 @@ def test_auto_split_plan():
     assert _plan_num_splits(16, length, k, cu_count) == 32
     assert _plan_num_splits(32, length, k, cu_count) == 32
     assert _plan_num_splits(1, 4096, k, cu_count) == 2
+
+
+def test_packed_adaptive_harness_layout():
+    _require_supported_gpu()
+    case = _make_packed_case(
+        [2, 2, 2, 2, 1, 1, 1, 1],
+        128,
+        64,
+        seed=53,
+        independent_kv=True,
+        r_max=16,
+    )
+    assert case.live_rows == 12
+    assert case.q.shape == (16, 1, HEADS, HEAD_DIM)
+    assert case.weights.shape == (16, HEADS)
+    assert case.query_start_loc.tolist() == [0, 2, 4, 6, 8, 9, 10, 11, 12]
+    assert case.indices.tolist() == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+        4,
+        5,
+        6,
+        7,
+        0,
+        0,
+        0,
+        0,
+    ]
+    assert case.lengths.tolist() == [
+        127,
+        128,
+        127,
+        128,
+        127,
+        128,
+        127,
+        128,
+        128,
+        128,
+        128,
+        128,
+        0,
+        0,
+        0,
+        0,
+    ]
+    page_sets = [set(row.tolist()) for row in case.block_tables]
+    assert all(page_sets[i].isdisjoint(page_sets[j]) for i in range(8) for j in range(i))
 
 
 def test_preshuffled_page64_single_split_topk():
