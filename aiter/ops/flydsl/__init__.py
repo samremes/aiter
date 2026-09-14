@@ -46,6 +46,26 @@ _LAZY_IMPORTS = {
         ".fp8_paged_mqa_local_topk",
         "flydsl_fp8_paged_mqa_local_topk",
     ),
+    "flydsl_fp8_paged_mqa_group_max": (
+        ".fp8_paged_mqa_group_max_topk",
+        "flydsl_fp8_paged_mqa_group_max",
+    ),
+    "flydsl_fp8_paged_mqa_group_harvest": (
+        ".fp8_paged_mqa_group_max_topk",
+        "flydsl_fp8_paged_mqa_group_harvest",
+    ),
+    "flydsl_fp8_paged_mqa_group_max_topk": (
+        ".fp8_paged_mqa_group_max_topk",
+        "flydsl_fp8_paged_mqa_group_max_topk",
+    ),
+    "flydsl_fp8_paged_mqa_position_map": (
+        ".fp8_paged_mqa_group_max_topk",
+        "flydsl_fp8_paged_mqa_position_map",
+    ),
+    "torch_group_max_topk_prototype": (
+        ".fp8_paged_mqa_group_max_topk",
+        "torch_group_max_topk_prototype",
+    ),
     "flydsl_fp8_paged_mqa_topk": (
         ".fp8_paged_mqa_local_topk",
         "flydsl_fp8_paged_mqa_topk",
@@ -83,7 +103,11 @@ __all__ = [
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_group_harvest",
+    "flydsl_fp8_paged_mqa_group_max",
+    "flydsl_fp8_paged_mqa_group_max_topk",
     "flydsl_fp8_paged_mqa_local_topk",
+    "flydsl_fp8_paged_mqa_position_map",
     "flydsl_fp8_paged_mqa_topk",
     "flydsl_hgemm",
     "flydsl_mla_reduce_v1",
@@ -94,6 +118,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "torch_group_max_topk_prototype",
 ]
 
 

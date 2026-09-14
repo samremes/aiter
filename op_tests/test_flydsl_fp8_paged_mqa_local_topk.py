@@ -265,15 +265,28 @@ def run_torch(case):
     for row in range(rows):
         length = int(lengths[row].item())
         logical = torch.arange(length, device=case.q.device)
-        physical = (
-            case.block_tables[int(case.indices[row]), logical // page_size] * page_size
-            + logical % page_size
-        )
+        physical_pages = case.block_tables[int(case.indices[row]), logical // page_size]
+        page_ok = (physical_pages >= 0) & (physical_pages < case.kv.shape[0])
+        safe_pages = torch.where(page_ok, physical_pages, 0)
+        physical = safe_pages * page_size + logical % page_size
         keys = flat_kv[physical]
         dots = torch.sum(q[row].float()[:, None, :] * keys[None, :, :], dim=-1)
-        scaled = dots * flat_scales[physical][None, :]
-        activated = torch.relu(scaled)
-        outputs.append(torch.sum(case.weights[row, :, None] * activated, dim=0))
+        activated = torch.relu(dots)
+        weighted = torch.sum(
+            case.weights[row, :, None] * activated,
+            dim=0,
+        )
+        nonnegative_scale = torch.fmax(
+            flat_scales[physical],
+            torch.zeros((), dtype=torch.float32, device=case.q.device),
+        )
+        scores = weighted * nonnegative_scale
+        scores = torch.where(
+            page_ok & ~torch.isnan(scores),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+        outputs.append(scores)
     return outputs
 
 

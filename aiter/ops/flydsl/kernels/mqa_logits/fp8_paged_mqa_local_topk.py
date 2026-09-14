@@ -30,6 +30,7 @@ from ..split_topk_merge_layout import (
     ROW_STRIDE,
 )
 from ..tensor_shim import GTensor, _run_compiled, _to_raw
+from .fp8_paged_mqa_score_common import canonical_score_tile
 
 HEADS = 32
 HEAD_DIM = 128
@@ -90,14 +91,16 @@ def fp8_paged_mqa_local_topk_kernel_name(
     prepare_merge: bool,
     ordered_emit: bool = True,
     restore_merge_workspace: bool = False,
+    emit_group_max: bool = False,
 ) -> str:
     layout_name = "preshuffled" if preshuffled else "rowmajor"
     packed_tag = "_packed" if packed else ""
+    group_max_tag = "_gm1" if emit_group_max else ""
     return (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
         f"pm{int(prepare_merge)}_oe{int(ordered_emit)}_"
-        f"rm{int(restore_merge_workspace)}_bitonic_{arch}"
+        f"rm{int(restore_merge_workspace)}{group_max_tag}_bitonic_{arch}"
     )
 
 _RETAINED = 0
@@ -182,6 +185,7 @@ def compile_fp8_paged_mqa_local_topk(
     packed: bool = False,
     ordered_emit: bool = True,
     restore_merge_workspace: bool = False,
+    emit_group_max: bool = False,
 ):
     """Compile an H32D128 Stage-A specialization."""
     if topk not in SUPPORTED_K:
@@ -208,6 +212,7 @@ def compile_fp8_paged_mqa_local_topk(
         prepare_merge=prepare_merge,
         ordered_emit=ordered_emit,
         restore_merge_workspace=restore_merge_workspace,
+        emit_group_max=emit_group_max,
     )
     page_index_dim = INDEX_DIM if packed else HEAD_DIM
     block_i32 = page_size * page_index_dim // 4
@@ -310,6 +315,7 @@ def compile_fp8_paged_mqa_local_topk(
         lengths = GTensor(context_lens, dtype=T.i32, shape=(-1,))
         requests = GTensor(row_requests, dtype=T.i32, shape=(-1,))
         tables = GTensor(block_tables, dtype=T.i32, shape=(-1,))
+        group_max_stride = num_splits * fx.Int32(topk)
 
         storage = fx.SharedAllocator().allocate(storage_type)
         pool_values = storage.pool_values.peek().view(fx.make_layout(pool_capacity, 1))
@@ -588,53 +594,51 @@ def compile_fp8_paged_mqa_local_topk(
                 _values[_dst] = _score
                 _indices[_dst] = fx.Uint16(_relative)
 
+        @flyc.jit
+        def _write_group_max(_pred, _index, _score, _base=candidate_scores):
+            if _pred:
+                fx.ptr_store(
+                    _score,
+                    fx.add_offset(fx.get_iter(_base), _index),
+                )
+
         def _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, page_oks):
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 logical = logical_tiles[ni]
                 k_pack = k_packs[ni]
                 scale = scale_tiles[ni]
-                total = fx.Float32(0.0)
-                for mi in range_constexpr(M_TILES):
-                    q_pack = q_tiles[mi]
-                    acc = fx.Vector.filled(DREG, 0.0, fx.Float32)
-                    acc = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        result_type,
-                        [
-                            q_pack,
-                            k_pack,
-                            acc,
-                            0,
-                            0,
-                            0,
-                            neutral,
-                            0,
-                            neutral,
-                        ],
-                    )
-                    frag = fx.Vector(acc)
-                    for ii in range_constexpr(DREG):
-                        activated = fx.Float32(frag[ii]).maximumf(fx.Float32(0.0))
-                        weight = weight_frags[mi][ii]
-                        total = total + activated * weight
-                total = total + total.shuffle_xor(16, WAVE_SIZE)
-                total = total + total.shuffle_xor(32, WAVE_SIZE)
-                # `scale` is per position: it is the same for all DREG heads in a
-                # lane and across both shuffle_xor lane groups, so it factors out
-                # of the ReLU sum. Clamping it to >= 0 keeps that exact, since a
-                # negative or NaN scale must score 0 (previously supplied by
-                # maximumf on each scaled product).
-                total = total * scale.maximumf(fx.Float32(0.0))
-                total = page_oks[ni].select(total, fx.Float32(float("-inf")))
+                total = canonical_score_tile(
+                    q_tiles,
+                    weight_frags,
+                    k_pack,
+                    scale,
+                    page_oks[ni],
+                    result_type,
+                    neutral,
+                )
 
                 is_writer = (lane_div_16 == 0) & (logical < split_end)
-                destination = state[_RETAINED] + logical - batch_first
-
-                _write_candidate(
-                    is_writer,
-                    destination,
-                    total,
-                    logical - split_begin,
-                )
+                if const_expr(emit_group_max):
+                    gmax = total
+                    gmax = gmax.maximumf(gmax.shuffle_xor(1, WAVE_SIZE))
+                    gmax = gmax.maximumf(gmax.shuffle_xor(2, WAVE_SIZE))
+                    gmax = gmax.maximumf(gmax.shuffle_xor(4, WAVE_SIZE))
+                    gmax = gmax.maximumf(gmax.shuffle_xor(8, WAVE_SIZE))
+                    store = is_writer & (lane_mod_16 == 0)
+                    group_id = _udiv(logical, fx.Int32(MFMA_N))
+                    _write_group_max(
+                        store,
+                        row * group_max_stride + group_id,
+                        gmax,
+                    )
+                else:
+                    destination = state[_RETAINED] + logical - batch_first
+                    _write_candidate(
+                        is_writer,
+                        destination,
+                        total,
+                        logical - split_begin,
+                    )
 
         # Keep the second tile's paged loads in flight during the first tile's score path.
         tiles_per_group = 2
@@ -680,10 +684,39 @@ def compile_fp8_paged_mqa_local_topk(
                 TILES_PER_COMPACT
             )
             final_tile = col0 + group_n >= split_end
-            if end_of_batch | final_tile:
+            if const_expr(not emit_group_max):
+                if end_of_batch | final_tile:
+                    gpu.barrier()
+                    batch_end = _imin(col0 + group_n, split_end)
+                    incoming_count = batch_end - batch_first
+                    pool_count = state[_RETAINED] + incoming_count
+                    if pool_count > fx.Int32(topk):
+                        _compact(
+                            pool_count,
+                            state,
+                            histogram,
+                            scan,
+                            pool_values,
+                            pool_indices,
+                        )
+                    else:
+                        if tid == 0:
+                            state[_RETAINED] = pool_count
+                        gpu.barrier()
+            tile_number = tile_number + fx.Int32(tiles_per_group)
+
+        for col0 in range(paired_end, split_end, fx.Int32(BLOCK_N)):
+            batch_tile = _umod(tile_number, TILES_PER_COMPACT)
+            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
+            page_i32s, page_oks = _load_pages(col0)
+            logical_tiles, k_packs, scale_tiles, chunk_oks = _load_chunk(
+                col0, page_i32s, page_oks
+            )
+            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, chunk_oks)
+
+            if const_expr(not emit_group_max):
                 gpu.barrier()
-                batch_end = _imin(col0 + group_n, split_end)
-                incoming_count = batch_end - batch_first
+                incoming_count = split_end - batch_first
                 pool_count = state[_RETAINED] + incoming_count
                 if pool_count > fx.Int32(topk):
                     _compact(
@@ -698,138 +731,112 @@ def compile_fp8_paged_mqa_local_topk(
                     if tid == 0:
                         state[_RETAINED] = pool_count
                     gpu.barrier()
-            tile_number = tile_number + fx.Int32(tiles_per_group)
-
-        for col0 in range(paired_end, split_end, fx.Int32(BLOCK_N)):
-            batch_tile = _umod(tile_number, TILES_PER_COMPACT)
-            batch_first = col0 - batch_tile * fx.Int32(BLOCK_N)
-            page_i32s, page_oks = _load_pages(col0)
-            logical_tiles, k_packs, scale_tiles, chunk_oks = _load_chunk(
-                col0, page_i32s, page_oks
-            )
-            _score_chunk(batch_first, logical_tiles, k_packs, scale_tiles, chunk_oks)
-
-            gpu.barrier()
-            incoming_count = split_end - batch_first
-            pool_count = state[_RETAINED] + incoming_count
-            if pool_count > fx.Int32(topk):
-                _compact(
-                    pool_count,
-                    state,
-                    histogram,
-                    scan,
-                    pool_values,
-                    pool_indices,
-                )
-            else:
-                if tid == 0:
-                    state[_RETAINED] = pool_count
-                gpu.barrier()
             tile_number = tile_number + fx.Int32(1)
 
-        retained = state[_RETAINED]
-        if const_expr(ordered_emit):
-            _sort_survivors(retained, pool_values, pool_indices)
-        output_scores_row = fx.slice(
-            candidate_scores,
-            (row, split, None),
-        )
-        output_positions_row = fx.slice(
-            candidate_positions,
-            (row, split, None),
-        )
-        merge_histogram_row = fx.slice(
-            merge_histogram,
-            (row, 0, None),
-        )
-        merge_state_row = fx.slice(
-            merge_state,
-            (row, None),
-        )
-        if const_expr(prepare_merge):
-            for hist_step in range_constexpr(
-                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
-            ):
-                histogram[hist_step * BLOCK_THREADS + tid] = 0
-            if split == 0 and tid == 0:
-                merge_state_row[_MERGE_PREFIX] = 0
-                merge_state_row[_MERGE_MASK] = 0
-                merge_state_row[_MERGE_REMAINING] = _imin(
-                    valid_len,
-                    fx.Int32(topk),
-                )
-                merge_state_row[_MERGE_WRITE_COUNTER] = 0
-                merge_state_row[_MERGE_EQ_COUNTER] = 0
-                merge_state_row[_MERGE_DIRECT] = 0
-            gpu.barrier()
-
-        for step in range_constexpr(output_steps):
-            slot = fx.Int32(step * BLOCK_THREADS) + tid
-            if slot < fx.Int32(topk):
-                live = slot < retained
-                safe_slot = live.select(slot, fx.Int32(0))
-                candidate_score = pool_values[safe_slot]
-                output_scores_row[slot] = live.select(
-                    candidate_score,
-                    fx.Float32(float("-inf")),
-                )
-                output_positions_row[slot] = live.select(
-                    split_begin + fx.Int32(pool_indices[safe_slot]),
-                    fx.Int32(-1),
-                )
-                if const_expr(prepare_merge):
-
-                    @flyc.jit
-                    def _count_candidate(
-                        _pred=live,
-                        _score=candidate_score,
-                        _histogram=histogram,
-                    ):
-                        if _pred:
-                            bucket = radix_bucket(
-                                f32_to_ordered_i32(_score),
-                                0,
-                            ) ^ fx.Int32(RADIX_SIGN_BIT)
-                            atomic_add_i32(
-                                _histogram,
-                                1,
-                                bucket,
-                                "workgroup",
-                            )
-
-                    _count_candidate()
-        if const_expr(prepare_merge):
-            gpu.barrier()
-            for hist_step in range_constexpr(
-                (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
-            ):
-                hist_bin = hist_step * BLOCK_THREADS + tid
-                count = histogram[hist_bin]
-                if count != 0:
-                    atomic_add_i32(
-                        merge_histogram_row,
-                        count,
-                        hist_bin,
-                        "agent",
-                    )
-            gpu.barrier()
-        if const_expr(restore_merge_workspace):
-            if split == 0:
-                row_base = row * fx.Int32(ROW_STRIDE)
-                if tid < fx.Int32(COUNTER_GROUP):
-                    merge_workspace[row_base + tid] = 0
-                for hist_step in range_constexpr(NUM_HIST_BINS // BLOCK_THREADS):
-                    hist_bin = hist_step * BLOCK_THREADS + tid
-                    merge_workspace[row_base + fx.Int32(HIST1_OFF) + hist_bin] = 0
-                    merge_workspace[row_base + fx.Int32(HIST2_OFF) + hist_bin] = 0
-        if tid == 0:
-            fx.ptr_store(
-                retained,
-                fx.add_offset(
-                    fx.get_iter(candidate_counts),
-                    row * num_splits + split,
-                ),
+        if const_expr(not emit_group_max):
+            retained = state[_RETAINED]
+            if const_expr(ordered_emit):
+                _sort_survivors(retained, pool_values, pool_indices)
+            output_scores_row = fx.slice(
+                candidate_scores,
+                (row, split, None),
             )
+            output_positions_row = fx.slice(
+                candidate_positions,
+                (row, split, None),
+            )
+            merge_histogram_row = fx.slice(
+                merge_histogram,
+                (row, 0, None),
+            )
+            merge_state_row = fx.slice(
+                merge_state,
+                (row, None),
+            )
+            if const_expr(prepare_merge):
+                for hist_step in range_constexpr(
+                    (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                ):
+                    histogram[hist_step * BLOCK_THREADS + tid] = 0
+                if split == 0 and tid == 0:
+                    merge_state_row[_MERGE_PREFIX] = 0
+                    merge_state_row[_MERGE_MASK] = 0
+                    merge_state_row[_MERGE_REMAINING] = _imin(
+                        valid_len,
+                        fx.Int32(topk),
+                    )
+                    merge_state_row[_MERGE_WRITE_COUNTER] = 0
+                    merge_state_row[_MERGE_EQ_COUNTER] = 0
+                    merge_state_row[_MERGE_DIRECT] = 0
+                gpu.barrier()
+
+            for step in range_constexpr(output_steps):
+                slot = fx.Int32(step * BLOCK_THREADS) + tid
+                if slot < fx.Int32(topk):
+                    live = slot < retained
+                    safe_slot = live.select(slot, fx.Int32(0))
+                    candidate_score = pool_values[safe_slot]
+                    output_scores_row[slot] = live.select(
+                        candidate_score,
+                        fx.Float32(float("-inf")),
+                    )
+                    output_positions_row[slot] = live.select(
+                        split_begin + fx.Int32(pool_indices[safe_slot]),
+                        fx.Int32(-1),
+                    )
+                    if const_expr(prepare_merge):
+
+                        @flyc.jit
+                        def _count_candidate(
+                            _pred=live,
+                            _score=candidate_score,
+                            _histogram=histogram,
+                        ):
+                            if _pred:
+                                bucket = radix_bucket(
+                                    f32_to_ordered_i32(_score),
+                                    0,
+                                ) ^ fx.Int32(RADIX_SIGN_BIT)
+                                atomic_add_i32(
+                                    _histogram,
+                                    1,
+                                    bucket,
+                                    "workgroup",
+                                )
+
+                        _count_candidate()
+            if const_expr(prepare_merge):
+                gpu.barrier()
+                for hist_step in range_constexpr(
+                    (NUM_HIST_BINS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                ):
+                    hist_bin = hist_step * BLOCK_THREADS + tid
+                    count = histogram[hist_bin]
+                    if count != 0:
+                        atomic_add_i32(
+                            merge_histogram_row,
+                            count,
+                            hist_bin,
+                            "agent",
+                        )
+                gpu.barrier()
+            if const_expr(restore_merge_workspace):
+                if split == 0:
+                    row_base = row * fx.Int32(ROW_STRIDE)
+                    if tid < fx.Int32(COUNTER_GROUP):
+                        merge_workspace[row_base + tid] = 0
+                    for hist_step in range_constexpr(NUM_HIST_BINS // BLOCK_THREADS):
+                        hist_bin = hist_step * BLOCK_THREADS + tid
+                        merge_workspace[row_base + fx.Int32(HIST1_OFF) + hist_bin] = 0
+                        merge_workspace[row_base + fx.Int32(HIST2_OFF) + hist_bin] = 0
+            if tid == 0:
+                fx.ptr_store(
+                    retained,
+                    fx.add_offset(
+                        fx.get_iter(candidate_counts),
+                        row * num_splits + split,
+                    ),
+                )
 
     @flyc.jit
     def launch(
@@ -905,6 +912,7 @@ def launch_fp8_paged_mqa_local_topk(
     restore_merge_workspace=False,
     merge_workspace=None,
     xcd_row_fast=None,
+    emit_group_max=False,
 ):
     page_size = kv_cache.shape[1]
     rows = row_requests.numel()
@@ -919,6 +927,7 @@ def launch_fp8_paged_mqa_local_topk(
         packed=packed,
         ordered_emit=ordered_emit,
         restore_merge_workspace=restore_merge_workspace,
+        emit_group_max=emit_group_max,
     )
     max_pages = block_tables.shape[1]
     num_pages = kv_cache.shape[0]
