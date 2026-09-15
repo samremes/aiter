@@ -637,10 +637,11 @@ def test_mla(
 
 
 ADAPTIVE_SCENARIOS = {
-    "mixed": ((1, 2, 4, 8), (1, 19, 2051, 4099)),
-    "zero": ((0, 1, 4, 2), (0, 1, 2, 65)),
-    "ragged": ((8, 4, 2, 1), (3, 17, 2053, 4097)),
-    "grow": ((8, 8, 4, 2), (11, 257, 3073, 6145)),
+    "mixed": ((1, 2, 4, 5, 8), (1, 19, 2051, 3073, 4099)),
+    "zero": ((0, 1, 4, 2, 0), (0, 1, 2, 65, 0)),
+    "ragged": ((8, 4, 2, 1, 5), (3, 17, 2053, 4097, 129)),
+    "grow": ((8, 8, 4, 2, 5), (11, 257, 3073, 6145, 2048)),
+    "empty_batch": ((0, 0, 0, 0, 0), (0, 0, 0, 0, 0)),
 }
 
 
@@ -654,6 +655,7 @@ class AdaptiveMLADecodeFixture:
     max_rows: int
     num_heads: int
     topk: int
+    mapping: str
     max_context_lens: tuple[int, ...]
     q: torch.Tensor
     kv_buffer: torch.Tensor
@@ -669,15 +671,33 @@ class AdaptiveMLADecodeFixture:
     sentinel: float
     live_rows: int = 0
     selected_physical: tuple[torch.Tensor, ...] = ()
+    selected_logical: tuple[torch.Tensor, ...] = ()
 
     @classmethod
-    def create(cls, max_rows, num_heads, topk, max_context_lens, sentinel=-123.0):
+    def create(
+        cls,
+        max_rows,
+        num_heads,
+        topk,
+        max_context_lens,
+        mapping="page64",
+        sentinel=-123.0,
+    ):
         num_requests = len(max_context_lens)
-        physical_tokens = sum(max_context_lens) + 17 * num_requests
+        if mapping == "page64":
+            physical_pages = (
+                sum((length + 63) // 64 + 17 for length in max_context_lens) + 1
+            )
+            physical_tokens = physical_pages * 64
+        elif mapping == "token_shuffle":
+            physical_tokens = sum(max_context_lens) + 17 * num_requests + 1
+        else:
+            raise ValueError(f"unsupported mapping: {mapping}")
         return cls(
             max_rows=max_rows,
             num_heads=num_heads,
             topk=topk,
+            mapping=mapping,
             max_context_lens=tuple(max_context_lens),
             q=torch.empty((max_rows, num_heads, 576), dtype=dtypes.fp8),
             kv_buffer=torch.empty((physical_tokens, 1, 576), dtype=dtypes.fp8),
@@ -740,25 +760,56 @@ class AdaptiveMLADecodeFixture:
             self.q[:live_rows].copy_(_quantize_fp8(q_values, q_scale))
 
         self.kv_buffer.fill_(float("nan"))
-        kv_values = torch.randn(
-            self.kv_buffer.shape,
-            generator=generator,
-            dtype=torch.float32,
-            device=self.kv_buffer.device,
-        )
-        self.kv_buffer.copy_(_quantize_fp8(kv_values, kv_scale))
-
         cpu_generator = torch.Generator(device="cpu").manual_seed(seed + 1009)
-        permutation = torch.randperm(
-            self.kv_buffer.shape[0], generator=cpu_generator, device="cpu"
-        ).tolist()
         request_pages = []
         offset = 0
-        for context_len, maximum in zip(context_lens, self.max_context_lens):
-            request_pages.append(permutation[offset : offset + context_len])
-            offset += maximum + 17
+        if self.mapping == "page64":
+            permutation = torch.randperm(
+                self.kv_buffer.shape[0] // 64 - 1,
+                generator=cpu_generator,
+                device="cpu",
+            ).tolist()
+            for context_len, maximum in zip(context_lens, self.max_context_lens):
+                maximum_blocks = (maximum + 63) // 64
+                block_table = permutation[offset : offset + maximum_blocks]
+                request_pages.append(
+                    [
+                        block_table[position // 64] * 64 + position % 64
+                        for position in range(context_len)
+                    ]
+                )
+                offset += maximum_blocks + 17
+        else:
+            permutation = torch.randperm(
+                self.kv_buffer.shape[0] - 1,
+                generator=cpu_generator,
+                device="cpu",
+            ).tolist()
+            for context_len, maximum in zip(context_lens, self.max_context_lens):
+                request_pages.append(permutation[offset : offset + context_len])
+                offset += maximum + 17
+        active_pages = [page for pages in request_pages for page in pages]
+        if active_pages:
+            active_page_tensor = torch.tensor(
+                active_pages, dtype=torch.int64, device=self.kv_buffer.device
+            )
+            kv_values = torch.full(
+                self.kv_buffer.shape,
+                float("nan"),
+                dtype=torch.float32,
+                device=self.kv_buffer.device,
+            )
+            active_values = torch.randn(
+                (len(active_pages), 1, 576),
+                generator=generator,
+                dtype=torch.float32,
+                device=self.kv_buffer.device,
+            )
+            kv_values.index_copy_(0, active_page_tensor, active_values)
+            self.kv_buffer.copy_(_quantize_fp8(kv_values, kv_scale))
 
         selected_physical = []
+        selected_logical = []
         row_indptr = [0]
         row_indices = []
         row = 0
@@ -776,7 +827,9 @@ class AdaptiveMLADecodeFixture:
                         device=self.q.device,
                     )
                 else:
+                    logical = torch.empty(0, dtype=torch.int64, device="cpu")
                     physical = torch.empty(0, dtype=torch.int32, device=self.q.device)
+                selected_logical.append(logical)
                 selected_physical.append(physical)
                 row_indices.extend(physical.cpu().tolist())
                 row_indptr.append(len(row_indices))
@@ -785,6 +838,7 @@ class AdaptiveMLADecodeFixture:
             selected_physical.append(
                 torch.empty(0, dtype=torch.int32, device=self.q.device)
             )
+            selected_logical.append(torch.empty(0, dtype=torch.int64, device="cpu"))
             row_indptr.append(len(row_indices))
             row += 1
 
@@ -799,6 +853,7 @@ class AdaptiveMLADecodeFixture:
         self.output.fill_(self.sentinel)
         self.live_rows = live_rows
         self.selected_physical = tuple(selected_physical)
+        self.selected_logical = tuple(selected_logical)
         return self
 
     @property
@@ -814,6 +869,7 @@ def build_adaptive_mla_fixture(
     max_rows=32,
     seed=1,
     max_context_lens=None,
+    mapping="page64",
 ):
     if max_context_lens is None:
         max_context_lens = context_lens
@@ -822,15 +878,17 @@ def build_adaptive_mla_fixture(
         num_heads=num_heads,
         topk=topk,
         max_context_lens=max_context_lens,
+        mapping=mapping,
     )
     return fixture.load(widths, context_lens, seed)
 
 
-def torch_mla_varlen_sparse_reference(fixture):
+def torch_mla_varlen_sparse_reference(fixture, sm_scale=None):
     output = torch.full_like(fixture.output, fixture.sentinel)
     q = fixture.q.float() * fixture.q_scale.float()
     kv = fixture.kv_buffer[:, 0].float() * fixture.kv_scale.float()
-    sm_scale = 1.0 / (576**0.5)
+    if sm_scale is None:
+        sm_scale = 1.0 / (576**0.5)
     for row in range(fixture.live_rows):
         physical = fixture.selected_physical[row]
         if physical.numel() == 0:
@@ -843,6 +901,73 @@ def torch_mla_varlen_sparse_reference(fixture):
     return output
 
 
+def _adaptive_error_metrics(reference, output):
+    reference_fp32 = reference.float()
+    output_fp32 = output.float()
+    difference = output_fp32 - reference_fp32
+    finite = torch.isfinite(output_fp32)
+    tolerance = 0.01 + 0.01 * reference_fp32.abs()
+    return {
+        "max_abs": difference.abs().max().item(),
+        "rms": difference.square().mean().sqrt().item(),
+        "mismatch": int((difference.abs() > tolerance).sum().item()),
+        "nonfinite": int((~finite).sum().item()),
+    }
+
+
+def _build_adaptive_cancellation_fixture(num_heads):
+    fixture = build_adaptive_mla_fixture(
+        (1,),
+        (2,),
+        num_heads,
+        2,
+        max_rows=1,
+        seed=211,
+        max_context_lens=(2,),
+        mapping="page64",
+    )
+    fixture.q_scale.fill_(1.0)
+    fixture.kv_scale.fill_(1.0)
+    fixture.q.zero_()
+    fixture.q[:, :, 0].fill_(1.0)
+    selected = fixture.selected_physical[0].to(torch.int64)
+    positive = torch.ones((1, 1, 576), dtype=torch.float32, device=fixture.q.device)
+    negative = -positive
+    positive[:, :, 0].fill_(0.375)
+    negative[:, :, 0].fill_(-0.375)
+    values = torch.cat((positive, negative), dim=0).to(dtypes.fp8)
+    for source_row, physical_row in enumerate(selected.cpu().tolist()):
+        fixture.kv_buffer[physical_row].copy_(values[source_row])
+    fixture.output.fill_(fixture.sentinel)
+    return fixture
+
+
+def _build_adaptive_dominant_tail_fixture(num_heads):
+    fixture = build_adaptive_mla_fixture(
+        (1,),
+        (2048,),
+        num_heads,
+        2048,
+        max_rows=1,
+        seed=223,
+        max_context_lens=(2048,),
+        mapping="page64",
+    )
+    fixture.q_scale.fill_(1.0)
+    fixture.kv_scale.fill_(1.0)
+    fixture.q.zero_()
+    fixture.q[:, :, -1].fill_(24.0)
+    selected = fixture.selected_physical[0].cpu().tolist()
+    tail = torch.full((1, 576), 4.0, dtype=torch.float32, device=fixture.q.device)
+    tail[:, -1].fill_(-0.5)
+    tail = tail.to(dtypes.fp8)
+    fixture.kv_buffer[selected[0]].zero_()
+    for physical_row in selected[1:]:
+        fixture.kv_buffer[physical_row].copy_(tail)
+    fixture.output.fill_(fixture.sentinel)
+    return fixture
+
+
 @dataclass
 class _AdaptiveCandidate:
     name: str
@@ -850,60 +975,17 @@ class _AdaptiveCandidate:
     scratch_bytes: object
     checks_empty_rows: bool
     graph_native: bool
+    executed_heads: int
+    executed_qk_heads: int
+    executed_pv_heads: int
+    executed_splits: object
 
 
-def _aiter_flattened_candidate(fixture, num_kv_splits):
-    selected_count = fixture.selected_count
-    split_indptr = torch.arange(
-        0,
-        (fixture.live_rows + 1) * num_kv_splits,
-        num_kv_splits,
-        dtype=torch.int32,
-        device=fixture.q.device,
-    )
-
-    def invoke():
-        live_qo_indptr = fixture.qo_indptr[: fixture.live_rows + 1]
-        live_kv_indptr = fixture.kv_indptr[: fixture.live_rows + 1]
-        aiter.mla.mla_decode_fwd(
-            fixture.q[: fixture.live_rows],
-            fixture.kv_buffer.view(-1, 1, 1, 576),
-            fixture.output[: fixture.live_rows],
-            live_qo_indptr,
-            live_kv_indptr,
-            fixture.kv_indices[:selected_count],
-            fixture.kv_last_page_lens[: fixture.live_rows],
-            1,
-            1,
-            1,
-            1.0 / (576**0.5),
-            num_kv_splits=num_kv_splits,
-            num_kv_splits_indptr=split_indptr,
-            q_scale=fixture.q_scale,
-            kv_scale=fixture.kv_scale,
-            causal=False,
-        )
-        return fixture.output
-
-    def scratch_bytes():
-        return fixture.live_rows * num_kv_splits * fixture.num_heads * 513 * 4 * 2
-
-    return _AdaptiveCandidate(
-        name="aiter_flattened_asm_decode_merge",
-        invoke=invoke,
-        scratch_bytes=scratch_bytes,
-        checks_empty_rows=False,
-        graph_native=False,
-    )
-
-
-def _production_adaptive_candidate(fixture, num_kv_splits):
+def _adaptive_candidate(fixture, num_kv_splits, module_name, candidate_name):
     try:
-        module = importlib.import_module("aiter.ops.flydsl.mla_decode_varlen")
-    except ModuleNotFoundError as error:
-        if error.name == "aiter.ops.flydsl.mla_decode_varlen":
-            return None
-        raise
+        module = importlib.import_module(module_name)
+    except (ImportError, OSError):
+        return None
     function = module.mla_decode_varlen
     factory = getattr(module, "create_mla_decode_varlen_workspace", None)
     workspace = (
@@ -939,16 +1021,38 @@ def _production_adaptive_candidate(fixture, num_kv_splits):
             return 0
         return int(estimator(workspace))
 
+    def executed_splits():
+        if workspace is not None and hasattr(workspace, "row_splits"):
+            return workspace.row_splits[: fixture.live_rows].cpu().tolist()
+        if workspace is not None and hasattr(workspace, "stage_splits"):
+            return workspace.stage_splits
+        return num_kv_splits
+
+    if candidate_name == "flydsl_adaptive" and fixture.num_heads == 8:
+        executed_qk_heads = fixture.num_heads
+        executed_pv_heads = fixture.num_heads
+    elif candidate_name == "flydsl_adaptive":
+        value_groups = 8 // (min(fixture.num_heads, 64) // 16)
+        executed_qk_heads = fixture.num_heads * value_groups
+        executed_pv_heads = 2 * fixture.num_heads
+    else:
+        executed_qk_heads = fixture.num_heads
+        executed_pv_heads = fixture.num_heads
+
     return _AdaptiveCandidate(
-        name="adaptive_varlen",
+        name=candidate_name,
         invoke=invoke,
         scratch_bytes=scratch_bytes,
         checks_empty_rows=True,
         graph_native=True,
+        executed_heads=fixture.num_heads,
+        executed_qk_heads=executed_qk_heads,
+        executed_pv_heads=executed_pv_heads,
+        executed_splits=executed_splits,
     )
 
 
-def _validate_adaptive_output(fixture, reference, candidate, expected):
+def _validate_adaptive_output(fixture, reference, output, candidate, expected):
     if candidate.checks_empty_rows:
         checked_rows = torch.arange(fixture.live_rows, device=fixture.q.device)
     else:
@@ -963,12 +1067,91 @@ def _validate_adaptive_output(fixture, reference, candidate, expected):
         )
     err = checkAllclose(
         reference.index_select(0, checked_rows).float(),
-        candidate.index_select(0, checked_rows).float(),
+        output.index_select(0, checked_rows).float(),
         msg=expected,
     )
-    if not torch.equal(candidate[fixture.live_rows :], reference[fixture.live_rows :]):
+    if err != 0:
+        raise AssertionError(f"{expected}: error ratio {err:.6f}")
+    request_offsets = fixture.query_start_loc.cpu().tolist()
+    for request_index, (begin, end) in enumerate(itertools.pairwise(request_offsets)):
+        request_err = checkAllclose(
+            reference[begin:end].float(),
+            output[begin:end].float(),
+            msg=f"{expected}: request {request_index}",
+        )
+        if request_err != 0:
+            raise AssertionError(
+                f"{expected}: request {request_index} error ratio " f"{request_err:.6f}"
+            )
+    if not torch.equal(output[fixture.live_rows :], reference[fixture.live_rows :]):
         raise AssertionError(f"{expected}: padded output rows were modified")
     return err
+
+
+def _validate_adaptive_fixture(
+    fixture, widths, context_lens, allow_nonempty_padding=False
+):
+    expected_lens = torch.tensor(widths, dtype=torch.int32, device=fixture.q.device)
+    if not torch.equal(torch.diff(fixture.query_start_loc), expected_lens):
+        raise AssertionError("query_start_loc does not encode decode widths")
+    if fixture.live_rows != sum(widths):
+        raise AssertionError("packed live-row count is inconsistent")
+    if not allow_nonempty_padding and not torch.equal(
+        fixture.kv_indptr[fixture.live_rows :],
+        fixture.kv_indptr[fixture.live_rows].expand(
+            fixture.max_rows + 1 - fixture.live_rows
+        ),
+    ):
+        raise AssertionError("padded CSR rows are not empty")
+    if (
+        fixture.live_rows < fixture.max_rows
+        and not torch.isnan(fixture.q[fixture.live_rows :].float()).all()
+    ):
+        raise AssertionError("padded query rows are not poisoned")
+    if (
+        fixture.live_rows
+        and not torch.isfinite(fixture.q[: fixture.live_rows].float()).all()
+    ):
+        raise AssertionError("live query rows contain poison values")
+    if not torch.isnan(fixture.kv_buffer.float()).any():
+        raise AssertionError("unused KV pages are not poisoned")
+    selected_count = int(fixture.kv_indptr[fixture.live_rows].item())
+    if selected_count:
+        selected = fixture.kv_indices[:selected_count].to(torch.int64)
+        if not torch.isfinite(
+            fixture.kv_buffer.index_select(0, selected).float()
+        ).all():
+            raise AssertionError("selected KV pages contain poison values")
+
+    expected_counts = []
+    request_sets = []
+    row = 0
+    for width, context_len in zip(widths, context_lens):
+        request_set = set()
+        for token_index in range(width):
+            causal_bound = max(context_len - width + token_index + 1, 0)
+            expected_count = min(causal_bound, fixture.topk)
+            expected_counts.append(expected_count)
+            logical = fixture.selected_logical[row]
+            if logical.numel() and int(logical.max()) >= causal_bound:
+                raise AssertionError("selected logical position exceeds causal bound")
+            request_set.update(fixture.selected_physical[row].cpu().tolist())
+            row += 1
+        request_sets.append(request_set)
+    actual_counts = torch.diff(fixture.kv_indptr[: fixture.live_rows + 1]).cpu()
+    if actual_counts.tolist() != expected_counts:
+        raise AssertionError("CSR row lengths do not match causal top-k bounds")
+    for left in range(len(request_sets)):
+        for right in range(left + 1, len(request_sets)):
+            if request_sets[left].intersection(request_sets[right]):
+                raise AssertionError("requests share physical cache pages")
+    nonempty_rows = [
+        tuple(sorted(indices.cpu().tolist()))
+        for indices in fixture.selected_physical[: fixture.live_rows]
+        if indices.numel()
+    ]
+    if len(nonempty_rows) != len(set(nonempty_rows)):
+        raise AssertionError("query rows do not have unique selected sets")
 
 
 def _adaptive_work(fixture):
@@ -987,8 +1170,11 @@ def _adaptive_work(fixture):
 
 
 def _run_graph_replay(candidate, fixture):
-    replay_names = ("zero", "mixed", "grow", "ragged", "mixed")
+    replay_names = ("empty_batch", "mixed", "grow", "zero", "ragged", "mixed")
     widths, context_lens = ADAPTIVE_SCENARIOS["zero"]
+    groups = fixture.decode_lens.numel() // len(widths)
+    widths = widths * groups
+    context_lens = context_lens * groups
     fixture.load(widths, context_lens, 701)
     side_stream = torch.cuda.Stream()
     side_stream.wait_stream(torch.cuda.current_stream())
@@ -1002,7 +1188,30 @@ def _run_graph_replay(candidate, fixture):
     previous = None
     for replay_index, name in enumerate(replay_names):
         widths, context_lens = ADAPTIVE_SCENARIOS[name]
+        widths = widths * groups
+        context_lens = context_lens * groups
         fixture.load(widths, context_lens, 809 + replay_index)
+        poison_padding = replay_index % 2 == 1 and fixture.live_rows < fixture.max_rows
+        if poison_padding:
+            base = int(fixture.kv_indptr[fixture.live_rows].item())
+            padding_rows = fixture.max_rows - fixture.live_rows
+            fixture.kv_indptr[fixture.live_rows + 1 :].copy_(
+                torch.arange(
+                    base + 1,
+                    base + padding_rows + 1,
+                    dtype=torch.int32,
+                    device=fixture.q.device,
+                )
+            )
+            fixture.kv_indices[base : base + padding_rows].fill_(
+                fixture.kv_buffer.shape[0] - 1
+            )
+        _validate_adaptive_fixture(
+            fixture,
+            widths,
+            context_lens,
+            allow_nonempty_padding=poison_padding,
+        )
         reference = torch_mla_varlen_sparse_reference(fixture)
         graph.replay()
         torch.cuda.synchronize()
@@ -1010,6 +1219,7 @@ def _run_graph_replay(candidate, fixture):
             fixture,
             reference,
             fixture.output,
+            candidate,
             f"{candidate.name}: graph replay {name}",
         )
         current = fixture.output.clone()
@@ -1021,6 +1231,27 @@ def _run_graph_replay(candidate, fixture):
     return 0
 
 
+def _run_packed_graph_perftest(candidate, packed_launches):
+    candidate.invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(packed_launches):
+            candidate.invoke()
+
+    def replay():
+        graph.replay()
+
+    _, packed_microseconds = run_perftest(
+        replay,
+        num_warmup=5,
+        num_iters=31,
+        num_rotate_args=1,
+        use_cuda_event=True,
+    )
+    return packed_microseconds / packed_launches
+
+
 @benchmark()
 def test_mla_varlen_adaptive(
     scenario,
@@ -1028,110 +1259,711 @@ def test_mla_varlen_adaptive(
     topk,
     max_rows,
     num_kv_splits,
+    groups,
+    mapping,
 ):
     widths, context_lens = ADAPTIVE_SCENARIOS[scenario]
-    max_context_lens = tuple(
+    widths = widths * groups
+    context_lens = context_lens * groups
+    base_max_context_lens = tuple(
         max(values)
         for values in zip(*(item[1] for item in ADAPTIVE_SCENARIOS.values()))
     )
+    max_context_lens = base_max_context_lens * groups
     fixture = build_adaptive_mla_fixture(
         widths,
         context_lens,
         nhead,
         topk,
-        max_rows=max_rows,
+        max_rows=max_rows * groups,
         seed=101,
         max_context_lens=max_context_lens,
+        mapping=mapping,
     )
+    _validate_adaptive_fixture(fixture, widths, context_lens)
     reference = torch_mla_varlen_sparse_reference(fixture)
     candidates = {}
-    if all(fixture.selected_physical[row].numel() for row in range(fixture.live_rows)):
-        flattened = _aiter_flattened_candidate(fixture, num_kv_splits)
-        candidates[flattened.name] = flattened
-    adaptive = _production_adaptive_candidate(fixture, num_kv_splits)
+    adaptive = _adaptive_candidate(
+        fixture,
+        num_kv_splits,
+        "aiter.ops.flydsl.mla_decode_varlen",
+        "flydsl_adaptive",
+    )
     if adaptive is not None:
         candidates[adaptive.name] = adaptive
+    triton_comparison = _adaptive_candidate(
+        fixture,
+        num_kv_splits,
+        "aiter.ops.triton.mla_decode_varlen",
+        "triton_comparison",
+    )
+    if triton_comparison is not None:
+        candidates[triton_comparison.name] = triton_comparison
 
     flops, io_bytes = _adaptive_work(fixture)
     ret = {
         "gfx": get_gfx(),
         "rows": fixture.live_rows,
         "selected": fixture.selected_count,
+        "working set": "hot-fixed",
         "adaptive available": adaptive is not None,
     }
+    if not candidates:
+        ret["status"] = "SKIP: no adaptive backend available"
+        aiter.logger.warning(ret["status"])
+        return ret
     for name, candidate in candidates.items():
         fixture.output.fill_(fixture.sentinel)
-        output, microseconds = run_perftest(
-            candidate.invoke,
-            num_warmup=10,
-            num_iters=51,
-            use_cuda_event=True,
-        )
+        output = candidate.invoke()
+        torch.cuda.synchronize()
         err = _validate_adaptive_output(
-            fixture, reference, output, f"{name}: independent fp32 oracle"
+            fixture,
+            reference,
+            output,
+            candidate,
+            f"{name}: independent fp32 oracle",
         )
         first = output.clone()
         fixture.output.fill_(fixture.sentinel)
         candidate.invoke()
         torch.cuda.synchronize()
-        if not torch.equal(first, fixture.output):
-            raise AssertionError(f"{name}: repeated invocation is not bitwise stable")
-        traffic_bytes = io_bytes + candidate.scratch_bytes()
+        repeated_metrics = _adaptive_error_metrics(reference, fixture.output)
+        if repeated_metrics["mismatch"] or repeated_metrics["nonfinite"]:
+            raise AssertionError(
+                f"{name}: repeated invocation failed oracle: {repeated_metrics}"
+            )
+        ret[f"{name} repeat equal"] = torch.equal(first, fixture.output)
+        graph_times = {
+            packed_launches: _run_packed_graph_perftest(candidate, packed_launches)
+            for packed_launches in (16, 32, 64)
+        }
+        microseconds = graph_times[64]
+        traffic_bytes = io_bytes
         ret[f"{name} us"] = microseconds
+        for packed_launches, graph_microseconds in graph_times.items():
+            ret[f"{name} graph{packed_launches} us"] = graph_microseconds
         ret[f"{name} TFLOPS"] = flops / microseconds / 1e6
         ret[f"{name} TB/s"] = traffic_bytes / microseconds / 1e6
+        ret[f"{name} bytes"] = traffic_bytes
+        ret[f"{name} scratch allocation bytes"] = candidate.scratch_bytes()
+        ret[f"{name} executed heads"] = candidate.executed_heads
+        ret[f"{name} executed QK heads"] = candidate.executed_qk_heads
+        ret[f"{name} executed PV heads"] = candidate.executed_pv_heads
+        ret[f"{name} executed splits"] = (
+            candidate.executed_splits()
+            if callable(candidate.executed_splits)
+            else candidate.executed_splits
+        )
         ret[f"{name} err"] = err
 
     if adaptive is not None:
-        ret["adaptive_varlen graph err"] = _run_graph_replay(adaptive, fixture)
+        ret["flydsl_adaptive graph err"] = _run_graph_replay(adaptive, fixture)
     return ret
 
 
-def main():
-    if get_gfx() not in ("gfx942", "gfx950"):
-        aiter.logger.warning(
-            "adaptive sparse MLA unsupported on %s; skipping", get_gfx()
+def _load_flydsl_adaptive_module():
+    if get_gfx() != "gfx950":
+        return None, f"FlyDSL adaptive MLA requires gfx950, got {get_gfx()}"
+    try:
+        module = importlib.import_module("aiter.ops.flydsl.mla_decode_varlen")
+    except (ImportError, OSError) as error:
+        return None, f"FlyDSL adaptive MLA unavailable: {error}"
+    return module, None
+
+
+def _run_adaptive_multiwave_auto_checks(module):
+    fixture = AdaptiveMLADecodeFixture.create(
+        max_rows=272,
+        num_heads=8,
+        topk=2048,
+        max_context_lens=(2056,) * 33,
+        mapping="page64",
+    )
+    workspace = module.create_mla_decode_varlen_workspace(
+        fixture.q, fixture.kv_buffer, fixture.output, num_kv_splits=None
+    )
+
+    def invoke():
+        module.mla_decode_varlen(
+            fixture.q,
+            fixture.kv_buffer,
+            fixture.output,
+            fixture.query_start_loc,
+            fixture.kv_indptr,
+            fixture.kv_indices,
+            q_scale=fixture.q_scale,
+            kv_scale=fixture.kv_scale,
+            workspace=workspace,
+            num_kv_splits=None,
         )
-        return
+
+    fixture.load((8,) * 32 + (0,), (2056,) * 33, seed=701)
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+
+    for case_index, (live_rows, empty_context) in enumerate(
+        (
+            (256, False),
+            (65, False),
+            (0, False),
+            (128, False),
+            (64, False),
+            (257, False),
+            (256, True),
+            (128, False),
+        )
+    ):
+        widths = tuple(min(max(live_rows - request * 8, 0), 8) for request in range(33))
+        fixture.load(widths, ((0 if empty_context else 2056),) * 33, 709 + case_index)
+        reference = torch_mla_varlen_sparse_reference(fixture)
+        for replay_index in range(4):
+            fixture.output.fill_(fixture.sentinel)
+            workspace.row_splits.fill_(-1)
+            workspace.work_indptr.fill_(-1)
+            workspace.finalize_count.fill_(-1)
+            graph.replay()
+            torch.cuda.synchronize()
+            metrics = _adaptive_error_metrics(reference, fixture.output)
+            if metrics["mismatch"] or metrics["nonfinite"]:
+                raise AssertionError(
+                    f"multiwave auto R{live_rows} empty={empty_context} "
+                    f"replay={replay_index} failed: {metrics}"
+                )
+            if not torch.equal(fixture.output[live_rows:], reference[live_rows:]):
+                raise AssertionError("multiwave auto graph modified output padding")
+            splits = workspace.row_splits[:live_rows].cpu()
+            if live_rows:
+                if empty_context:
+                    if torch.count_nonzero(splits).item():
+                        raise AssertionError("empty rows received attention tasks")
+                elif (
+                    splits.unique().numel() != 1
+                    or splits.min().item() < 1
+                    or splits.max().item() > workspace.stage_splits
+                ):
+                    raise AssertionError(
+                        f"identical CSR lengths received inconsistent auto splits: {splits}"
+                    )
+            if workspace.work_indptr[0].item() != splits.sum().item():
+                raise AssertionError("compact attention task count does not match rows")
+            expected_finalize = int((splits != 1).sum().item()) * fixture.num_heads
+            if workspace.finalize_count.item() != expected_finalize:
+                raise AssertionError("compact finalize count does not match rows")
+        aiter.logger.info(
+            "adaptive multiwave auto R%d empty=%s: four graph replays passed",
+            live_rows,
+            empty_context,
+        )
+
+
+def _run_adaptive_validation_checks(module):
+    _run_adaptive_multiwave_auto_checks(module)
+    fixture = build_adaptive_mla_fixture(
+        (1,),
+        (64,),
+        16,
+        64,
+        max_rows=4,
+        seed=97,
+        max_context_lens=(128,),
+    )
+    workspace = module.create_mla_decode_varlen_workspace(
+        fixture.q, fixture.kv_buffer, fixture.output, num_kv_splits=1
+    )
+
+    def expect(error_type, **overrides):
+        arguments = {
+            "q": fixture.q,
+            "kv_buffer": fixture.kv_buffer,
+            "o": fixture.output,
+            "query_start_loc": fixture.query_start_loc,
+            "kv_indptr": fixture.kv_indptr,
+            "kv_indices": fixture.kv_indices,
+            "q_scale": fixture.q_scale,
+            "kv_scale": fixture.kv_scale,
+            "workspace": workspace,
+            "num_kv_splits": 1,
+        }
+        arguments.update(overrides)
+        try:
+            module.mla_decode_varlen(**arguments)
+        except error_type:
+            return
+        raise AssertionError(f"expected {error_type.__name__} for {tuple(overrides)}")
+
+    expect(TypeError, q=fixture.q.to(torch.bfloat16))
+    expect(ValueError, kv_buffer=fixture.kv_buffer[:, 0])
+    expect(ValueError, q_scale=fixture.q_scale.cpu())
+    expect(
+        ValueError,
+        query_start_loc=torch.empty(0, dtype=torch.int32, device=fixture.q.device),
+    )
+    expect(ValueError, num_kv_splits=0)
+    bad_workspace = module.create_mla_decode_varlen_workspace(
+        fixture.q, fixture.kv_buffer, fixture.output, num_kv_splits=2
+    )
+    expect(ValueError, workspace=bad_workspace)
+    bad_stage_workspace = module.create_mla_decode_varlen_workspace(
+        fixture.q, fixture.kv_buffer, fixture.output, num_kv_splits=1
+    )
+    bad_stage_workspace.stage_splits = 2
+    expect(ValueError, workspace=bad_stage_workspace)
+    large_q = torch.empty((960, 128, 576), dtype=dtypes.fp8, device="meta")
+    small_kv = torch.empty((1, 1, 576), dtype=dtypes.fp8, device="meta")
+    large_output = torch.empty((960, 128, 512), dtype=torch.bfloat16, device="meta")
+    try:
+        module.create_mla_decode_varlen_workspace(
+            large_q, small_kv, large_output, num_kv_splits=16
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected signed-i32 workspace span rejection")
+
+    for cancellation_heads in (8, 16):
+        cancellation_fixture = _build_adaptive_cancellation_fixture(cancellation_heads)
+        cancellation_reference = torch_mla_varlen_sparse_reference(cancellation_fixture)
+        for splits in (1, 4, 16):
+            cancellation_workspace = module.create_mla_decode_varlen_workspace(
+                cancellation_fixture.q,
+                cancellation_fixture.kv_buffer,
+                cancellation_fixture.output,
+                num_kv_splits=splits,
+            )
+            cancellation_fixture.output.fill_(cancellation_fixture.sentinel)
+            module.mla_decode_varlen(
+                cancellation_fixture.q,
+                cancellation_fixture.kv_buffer,
+                cancellation_fixture.output,
+                cancellation_fixture.query_start_loc,
+                cancellation_fixture.kv_indptr,
+                cancellation_fixture.kv_indices,
+                q_scale=cancellation_fixture.q_scale,
+                kv_scale=cancellation_fixture.kv_scale,
+                workspace=cancellation_workspace,
+                num_kv_splits=splits,
+            )
+            torch.cuda.synchronize()
+            metrics = _adaptive_error_metrics(
+                cancellation_reference, cancellation_fixture.output
+            )
+            aiter.logger.info(
+                "adaptive cancellation H%d S%d: max_abs=%g rms=%g mismatch=%d nonfinite=%d",
+                cancellation_heads,
+                splits,
+                metrics["max_abs"],
+                metrics["rms"],
+                metrics["mismatch"],
+                metrics["nonfinite"],
+            )
+            if metrics["mismatch"] or metrics["nonfinite"]:
+                raise AssertionError(
+                    f"adaptive cancellation H{cancellation_heads} S{splits} failed: {metrics}"
+                )
+
+    for dominant_heads in (8, 16):
+        dominant_fixture = _build_adaptive_dominant_tail_fixture(dominant_heads)
+        dominant_reference = torch_mla_varlen_sparse_reference(
+            dominant_fixture, sm_scale=1.0
+        )
+        dominant_workspace = module.create_mla_decode_varlen_workspace(
+            dominant_fixture.q,
+            dominant_fixture.kv_buffer,
+            dominant_fixture.output,
+            num_kv_splits=1,
+        )
+        module.mla_decode_varlen(
+            dominant_fixture.q,
+            dominant_fixture.kv_buffer,
+            dominant_fixture.output,
+            dominant_fixture.query_start_loc,
+            dominant_fixture.kv_indptr,
+            dominant_fixture.kv_indices,
+            sm_scale=1.0,
+            q_scale=dominant_fixture.q_scale,
+            kv_scale=dominant_fixture.kv_scale,
+            workspace=dominant_workspace,
+            num_kv_splits=1,
+        )
+        torch.cuda.synchronize()
+        metrics = _adaptive_error_metrics(dominant_reference, dominant_fixture.output)
+        aiter.logger.info(
+            "adaptive dominant tail H%d S1: max_abs=%g rms=%g mismatch=%d nonfinite=%d",
+            dominant_heads,
+            metrics["max_abs"],
+            metrics["rms"],
+            metrics["mismatch"],
+            metrics["nonfinite"],
+        )
+        if metrics["mismatch"] or metrics["nonfinite"]:
+            raise AssertionError(
+                f"adaptive dominant tail H{dominant_heads} S1 failed: {metrics}"
+            )
+
+    canonical_lengths = (1, 31, 32, 63, 64, 65, 128, 256, 384, 512, 1024, 2048)
+    for mapping, num_heads, splits, seed in itertools.product(
+        ("page64", "token_shuffle"),
+        (8, 16, 32, 64, 128),
+        (1, 4, 16),
+        (307, 401),
+    ):
+        canonical_fixture = build_adaptive_mla_fixture(
+            (1,) * len(canonical_lengths),
+            canonical_lengths,
+            num_heads,
+            2048,
+            max_rows=len(canonical_lengths),
+            seed=seed,
+            max_context_lens=canonical_lengths,
+            mapping=mapping,
+        )
+        canonical_reference = torch_mla_varlen_sparse_reference(canonical_fixture)
+        canonical_workspace = module.create_mla_decode_varlen_workspace(
+            canonical_fixture.q,
+            canonical_fixture.kv_buffer,
+            canonical_fixture.output,
+            num_kv_splits=splits,
+        )
+        module.mla_decode_varlen(
+            canonical_fixture.q,
+            canonical_fixture.kv_buffer,
+            canonical_fixture.output,
+            canonical_fixture.query_start_loc,
+            canonical_fixture.kv_indptr,
+            canonical_fixture.kv_indices,
+            q_scale=canonical_fixture.q_scale,
+            kv_scale=canonical_fixture.kv_scale,
+            workspace=canonical_workspace,
+            num_kv_splits=splits,
+        )
+        torch.cuda.synchronize()
+        metrics = _adaptive_error_metrics(canonical_reference, canonical_fixture.output)
+        aiter.logger.info(
+            "adaptive canonical mapping=%s H%d S%d seed=%d: "
+            "max_abs=%g rms=%g mismatch=%d nonfinite=%d",
+            mapping,
+            num_heads,
+            splits,
+            seed,
+            metrics["max_abs"],
+            metrics["rms"],
+            metrics["mismatch"],
+            metrics["nonfinite"],
+        )
+        if metrics["mismatch"] or metrics["nonfinite"]:
+            raise AssertionError(
+                "adaptive canonical gate failed: "
+                f"mapping={mapping} H{num_heads} S{splits} seed={seed} {metrics}"
+            )
+
+    prepared_fixture = build_adaptive_mla_fixture(
+        (1, 2, 4, 5, 8),
+        (1, 129, 384, 1024, 2048),
+        8,
+        2048,
+        max_rows=24,
+        seed=467,
+        max_context_lens=(1, 129, 384, 1024, 2048),
+        mapping="token_shuffle",
+    )
+    prepared_reference = torch_mla_varlen_sparse_reference(prepared_fixture)
+    prepared = module.prepare_mla_decode_varlen(
+        prepared_fixture.q,
+        prepared_fixture.kv_buffer,
+        prepared_fixture.output,
+        prepared_fixture.query_start_loc,
+        prepared_fixture.kv_indptr,
+        prepared_fixture.kv_indices,
+        q_scale=prepared_fixture.q_scale,
+        kv_scale=prepared_fixture.kv_scale,
+        num_kv_splits=None,
+    )
+    prepared_q = prepared_fixture.q.clone()
+    prepared_kv = prepared_fixture.kv_buffer.clone()
+    prepared_indices = prepared_fixture.kv_indices.clone()
+    prepared_output = torch.empty_like(prepared_fixture.output)
+    prepared_output.fill_(prepared_fixture.sentinel)
+
+    def prepared_invoke():
+        module.execute_mla_decode_varlen_prepared(
+            prepared,
+            prepared_q,
+            prepared_kv,
+            prepared_output,
+            prepared_indices,
+            q_scale=prepared_fixture.q_scale,
+            kv_scale=prepared_fixture.kv_scale,
+        )
+
+    prepared_invoke()
+    torch.cuda.synchronize()
+    prepared_metrics = _adaptive_error_metrics(prepared_reference, prepared_output)
+    if prepared_metrics["mismatch"] or prepared_metrics["nonfinite"]:
+        raise AssertionError(
+            f"prepared independent-buffer route failed: {prepared_metrics}"
+        )
+    prepared_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(prepared_graph):
+        prepared_invoke()
+    for replay_index in range(3):
+        prepared_q.copy_(prepared_fixture.q)
+        prepared_kv.copy_(prepared_fixture.kv_buffer)
+        prepared_indices.copy_(prepared_fixture.kv_indices)
+        prepared_output.fill_(prepared_fixture.sentinel)
+        prepared_graph.replay()
+        torch.cuda.synchronize()
+        replay_metrics = _adaptive_error_metrics(prepared_reference, prepared_output)
+        if replay_metrics["mismatch"] or replay_metrics["nonfinite"]:
+            raise AssertionError(
+                f"prepared graph replay {replay_index} failed: {replay_metrics}"
+            )
+
+    for graph_heads in (8, 128):
+        graph_fixture = AdaptiveMLADecodeFixture.create(
+            max_rows=32,
+            num_heads=graph_heads,
+            topk=2048,
+            max_context_lens=(129, 2048, 3073, 6145, 4099),
+            mapping="page64",
+        )
+        for requested_splits, expected_splits in ((None, 16), (1, 1)):
+            graph_fixture.load(*ADAPTIVE_SCENARIOS["mixed"], seed=503)
+            graph_workspace = module.create_mla_decode_varlen_workspace(
+                graph_fixture.q,
+                graph_fixture.kv_buffer,
+                graph_fixture.output,
+                num_kv_splits=requested_splits,
+            )
+            if graph_workspace.stage_splits != expected_splits:
+                raise AssertionError(
+                    f"unexpected default split policy: {graph_workspace.stage_splits}"
+                )
+
+            def graph_invoke(
+                fixture=graph_fixture,
+                workspace=graph_workspace,
+                splits=requested_splits,
+            ):
+                module.mla_decode_varlen(
+                    fixture.q,
+                    fixture.kv_buffer,
+                    fixture.output,
+                    fixture.query_start_loc,
+                    fixture.kv_indptr,
+                    fixture.kv_indices,
+                    q_scale=fixture.q_scale,
+                    kv_scale=fixture.kv_scale,
+                    workspace=workspace,
+                    num_kv_splits=splits,
+                )
+
+            graph_invoke()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_invoke()
+            previous = None
+            for replay_index, scenario in enumerate(
+                ("empty_batch", "mixed", "grow", "zero", "ragged", "mixed")
+            ):
+                widths, context_lens = ADAPTIVE_SCENARIOS[scenario]
+                graph_fixture.load(widths, context_lens, 601 + replay_index)
+                reference = torch_mla_varlen_sparse_reference(graph_fixture)
+                graph.replay()
+                torch.cuda.synchronize()
+                metrics = _adaptive_error_metrics(reference, graph_fixture.output)
+                if metrics["mismatch"] or metrics["nonfinite"]:
+                    raise AssertionError(
+                        f"public graph H{graph_heads} {scenario} S{expected_splits} failed: {metrics}"
+                    )
+                if not torch.equal(
+                    graph_fixture.output[graph_fixture.live_rows :],
+                    reference[graph_fixture.live_rows :],
+                ):
+                    raise AssertionError(
+                        f"public graph H{graph_heads} {scenario} S{expected_splits} modified padding"
+                    )
+                current = graph_fixture.output.clone()
+                if previous is not None and scenario == "mixed" and replay_index == 5:
+                    graph_fixture.load(widths, context_lens, 601 + replay_index)
+                    repeated_reference = torch_mla_varlen_sparse_reference(
+                        graph_fixture
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    repeated_metrics = _adaptive_error_metrics(
+                        repeated_reference, graph_fixture.output
+                    )
+                    if repeated_metrics["mismatch"] or repeated_metrics["nonfinite"]:
+                        raise AssertionError(
+                            f"public graph H{graph_heads} S{expected_splits} repeated replay failed: {repeated_metrics}"
+                        )
+                previous = current
+
+
+def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="adaptive ragged sparse MLA decode correctness and performance",
+        description="sparse MLA decode correctness and performance",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        choices=("adaptive", "legacy"),
+        default=["legacy"],
+        help="test suite selection; adaptive FlyDSL tests require --modes adaptive",
     )
     parser.add_argument(
         "--scenarios",
         type=str,
         nargs="*",
         choices=tuple(ADAPTIVE_SCENARIOS),
-        default=["mixed", "zero", "ragged"],
+        default=["mixed", "zero", "ragged", "empty_batch"],
     )
-    parser.add_argument("-n", "--nhead", type=int, nargs="*", default=[16, 32, 64, 128])
+    parser.add_argument("-n", "--nhead", type=str, nargs="*", default=None)
     parser.add_argument("--topk", type=int, nargs="*", default=[128, 2048])
     parser.add_argument("--max-rows", type=int, nargs="*", default=[32])
-    parser.add_argument("--num-kv-splits", type=int, nargs="*", default=[8])
+    parser.add_argument("--num-kv-splits", type=int, nargs="*", default=[16])
+    parser.add_argument("--groups", type=int, nargs="*", default=[1])
+    parser.add_argument(
+        "--mapping",
+        type=str,
+        nargs="*",
+        choices=("page64", "token_shuffle"),
+        default=["page64"],
+    )
+    parser.add_argument("-k", "--kv_lora_rank", type=int, default=512)
+    parser.add_argument("-qn", "--qk_nope_head_dim", type=int, default=128)
+    parser.add_argument("-qr", "--qk_rope_head_dim", type=int, default=64)
+    parser.add_argument("-vh", "--v_head_dim", type=int, default=512)
+    parser.add_argument("-blk", "--block_size", type=int, default=1)
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp8],
+    )
+    parser.add_argument(
+        "-kvd",
+        "--kv_dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp8],
+    )
+    parser.add_argument(
+        "-c",
+        "--ctxLen",
+        type=int,
+        nargs="*",
+        default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    )
+    parser.add_argument(
+        "-b",
+        "--batchSize",
+        type=int,
+        nargs="*",
+        default=[1, 3, 5, 16, 32, 64, 128, 256],
+    )
+    parser.add_argument(
+        "-ms", "--max_split_per_batch", type=int, nargs="*", default=[32]
+    )
+    parser.add_argument("--varlen", action="store_true")
     args = parser.parse_args()
 
-    rows = []
-    for scenario, nhead, topk, max_rows, num_kv_splits in itertools.product(
-        args.scenarios,
-        args.nhead,
-        args.topk,
-        args.max_rows,
-        args.num_kv_splits,
-    ):
-        rows.append(
-            test_mla_varlen_adaptive(
+    if "adaptive" in args.modes:
+        adaptive_module, unavailable_reason = _load_flydsl_adaptive_module()
+        if adaptive_module is None:
+            aiter.logger.warning("%s; skipping adaptive suite", unavailable_reason)
+        else:
+            _run_adaptive_validation_checks(adaptive_module)
+            adaptive_heads = (
+                [8, 16, 32, 64, 128]
+                if args.nhead is None
+                else [int(value) for value in args.nhead]
+            )
+            rows = []
+            for (
                 scenario,
                 nhead,
                 topk,
                 max_rows,
                 num_kv_splits,
+                groups,
+                mapping,
+            ) in itertools.product(
+                args.scenarios,
+                adaptive_heads,
+                args.topk,
+                args.max_rows,
+                args.num_kv_splits,
+                args.groups,
+                args.mapping,
+            ):
+                rows.append(
+                    test_mla_varlen_adaptive(
+                        scenario,
+                        nhead,
+                        topk,
+                        max_rows,
+                        num_kv_splits,
+                        groups,
+                        mapping,
+                    )
+                )
+            dataframe = pd.DataFrame(rows)
+            aiter.logger.info(
+                "adaptive sparse MLA summary (markdown):\n%s",
+                dataframe.to_markdown(index=False),
             )
+
+    if "legacy" in args.modes:
+        legacy_heads = (
+            [(16, 2), (48, 1), (128, 2)]
+            if args.nhead is None
+            else [dtypes.str2tuple(value) for value in args.nhead]
         )
-    dataframe = pd.DataFrame(rows)
-    aiter.logger.info(
-        "adaptive sparse MLA summary (markdown):\n%s",
-        dataframe.to_markdown(index=False),
-    )
+        for nhead, decode_qlen in legacy_heads:
+            rows = []
+            for (
+                dtype,
+                kvtype,
+                ctx_len,
+                batch_size,
+                max_split_per_batch,
+            ) in itertools.product(
+                args.dtype,
+                args.kv_dtype,
+                args.ctxLen,
+                args.batchSize,
+                args.max_split_per_batch,
+            ):
+                if check_support(dtype, kvtype, nhead):
+                    rows.append(
+                        test_mla(
+                            ctx_len,
+                            batch_size,
+                            nhead,
+                            args.kv_lora_rank,
+                            args.qk_nope_head_dim,
+                            args.qk_rope_head_dim,
+                            args.v_head_dim,
+                            dtype,
+                            kvtype,
+                            args.block_size,
+                            varlen=args.varlen,
+                            decode_qlen=decode_qlen,
+                            max_split_per_batch=max_split_per_batch,
+                        )
+                    )
+            dataframe = pd.DataFrame(rows)
+            aiter.logger.info(
+                "mla_sparse summary (markdown):\n%s",
+                dataframe.to_markdown(index=False),
+            )
 
 
 if __name__ == "__main__":
