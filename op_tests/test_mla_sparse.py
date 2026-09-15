@@ -2,8 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import importlib
 import itertools
 import random
+from dataclasses import dataclass
 
 import pandas as pd
 import torch
@@ -12,6 +14,7 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -633,140 +636,503 @@ def test_mla(
     return ret
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-k",
-    "--kv_lora_rank",
-    type=int,
-    default=512,
-    help="""kv lora rank.
-    e.g.: -k 512""",
-)
-parser.add_argument(
-    "-qn",
-    "--qk_nope_head_dim",
-    type=int,
-    default=128,
-    help="""qk nope head dim.
-    e.g.: -qn 512""",
-)
-parser.add_argument(
-    "-qr",
-    "--qk_rope_head_dim",
-    type=int,
-    default=64,
-    help="""qk rope head dim.
-    e.g.: -qr 64""",
-)
-parser.add_argument(
-    "-vh",
-    "--v_head_dim",
-    type=int,
-    default=512,
-    help="""v head dim.
-    e.g.: -vh 512""",
-)
-parser.add_argument(
-    "-blk",
-    "--block_size",
-    type=int,
-    default=1,
-    help="""Block size.
-    e.g.: -blk 1""",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    nargs="*",
-    default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    metavar="{bf16, fp8}",
-    help="""Data type of Q.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-kvd",
-    "--kv_dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    nargs="*",
-    default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    metavar="{bf16, fp8}",
-    help="""Data type of KV.
-    e.g.: -kvd bf16""",
-)
-parser.add_argument(
-    "-c",
-    "--ctxLen",
-    type=int,
-    nargs="*",
-    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
-    help="""Context length.
-    e.g.: -c 21""",
-)
-parser.add_argument(
-    "-b",
-    "--batchSize",
-    type=int,
-    nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128, 256],
-    help="""Batch size.
-    e.g.: -b 16""",
-)
-parser.add_argument(
-    "-n",
-    "--nhead",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[(16, 2), (48, 1), (128, 2)],
-    help="""Number of heads.
-    e.g.: -n 16,1""",
-)
-parser.add_argument(
-    "-ms",
-    "--max_split_per_batch",
-    type=int,
-    nargs="*",
-    default=[32],
-    help="""kv seqlens max split num for per batch.
-    e.g.: -ms 32""",
-)
-parser.add_argument(
-    "--varlen",
-    action="store_true",
-    help="""variable kv seqlens per batch. Default: False.
-    --varlen # True""",
-)
+ADAPTIVE_SCENARIOS = {
+    "mixed": ((1, 2, 4, 8), (1, 19, 2051, 4099)),
+    "zero": ((0, 1, 4, 2), (0, 1, 2, 65)),
+    "ragged": ((8, 4, 2, 1), (3, 17, 2053, 4097)),
+    "grow": ((8, 8, 4, 2), (11, 257, 3073, 6145)),
+}
 
-args = parser.parse_args()
 
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
-                dtype,
-                kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                max_split_per_batch=max_split_per_batch,
+def _quantize_fp8(values, scale):
+    limit = torch.finfo(dtypes.fp8).max
+    return torch.clamp(values / scale, -limit, limit).to(dtypes.fp8)
+
+
+@dataclass
+class AdaptiveMLADecodeFixture:
+    max_rows: int
+    num_heads: int
+    topk: int
+    max_context_lens: tuple[int, ...]
+    q: torch.Tensor
+    kv_buffer: torch.Tensor
+    output: torch.Tensor
+    query_start_loc: torch.Tensor
+    decode_lens: torch.Tensor
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    kv_last_page_lens: torch.Tensor
+    q_scale: torch.Tensor
+    kv_scale: torch.Tensor
+    sentinel: float
+    live_rows: int = 0
+    selected_physical: tuple[torch.Tensor, ...] = ()
+
+    @classmethod
+    def create(cls, max_rows, num_heads, topk, max_context_lens, sentinel=-123.0):
+        num_requests = len(max_context_lens)
+        physical_tokens = sum(max_context_lens) + 17 * num_requests
+        return cls(
+            max_rows=max_rows,
+            num_heads=num_heads,
+            topk=topk,
+            max_context_lens=tuple(max_context_lens),
+            q=torch.empty((max_rows, num_heads, 576), dtype=dtypes.fp8),
+            kv_buffer=torch.empty((physical_tokens, 1, 576), dtype=dtypes.fp8),
+            output=torch.full(
+                (max_rows, num_heads, 512), sentinel, dtype=torch.bfloat16
+            ),
+            query_start_loc=torch.zeros(num_requests + 1, dtype=torch.int32),
+            decode_lens=torch.zeros(num_requests, dtype=torch.int32),
+            qo_indptr=torch.arange(max_rows + 1, dtype=torch.int32),
+            kv_indptr=torch.zeros(max_rows + 1, dtype=torch.int32),
+            kv_indices=torch.full((max_rows * topk,), -1, dtype=torch.int32),
+            kv_last_page_lens=torch.ones(max_rows, dtype=torch.int32),
+            q_scale=torch.ones(1, dtype=torch.float32),
+            kv_scale=torch.ones(1, dtype=torch.float32),
+            sentinel=sentinel,
+        )
+
+    def load(self, widths, context_lens, seed):
+        if len(widths) != self.decode_lens.numel():
+            raise ValueError("width count must match request capacity")
+        if len(context_lens) != len(widths):
+            raise ValueError("context length count must match width count")
+        if any(width < 0 for width in widths):
+            raise ValueError("decode widths must be non-negative")
+        if any(length < 0 for length in context_lens):
+            raise ValueError("context lengths must be non-negative")
+        if any(
+            length > maximum
+            for length, maximum in zip(context_lens, self.max_context_lens)
+        ):
+            raise ValueError("context length exceeds fixture capacity")
+        live_rows = sum(widths)
+        if live_rows > self.max_rows:
+            raise ValueError("live rows exceed graph capacity")
+
+        query_start_loc = [0]
+        for width in widths:
+            query_start_loc.append(query_start_loc[-1] + width)
+        self.query_start_loc.copy_(
+            torch.tensor(query_start_loc, dtype=torch.int32, device=self.q.device)
+        )
+        self.decode_lens.copy_(
+            torch.tensor(widths, dtype=torch.int32, device=self.q.device)
+        )
+
+        q_scale = 0.03125 + (seed % 5) * 0.00390625
+        kv_scale = 0.0234375 + (seed % 7) * 0.001953125
+        self.q_scale.fill_(q_scale)
+        self.kv_scale.fill_(kv_scale)
+
+        generator = torch.Generator(device=self.q.device).manual_seed(seed)
+        self.q.fill_(float("nan"))
+        if live_rows:
+            q_values = torch.randn(
+                (live_rows, self.num_heads, 576),
+                generator=generator,
+                dtype=torch.float32,
+                device=self.q.device,
             )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla_sparse summary (markdown):\n%s", df_md)
+            self.q[:live_rows].copy_(_quantize_fp8(q_values, q_scale))
+
+        self.kv_buffer.fill_(float("nan"))
+        kv_values = torch.randn(
+            self.kv_buffer.shape,
+            generator=generator,
+            dtype=torch.float32,
+            device=self.kv_buffer.device,
+        )
+        self.kv_buffer.copy_(_quantize_fp8(kv_values, kv_scale))
+
+        cpu_generator = torch.Generator(device="cpu").manual_seed(seed + 1009)
+        permutation = torch.randperm(
+            self.kv_buffer.shape[0], generator=cpu_generator, device="cpu"
+        ).tolist()
+        request_pages = []
+        offset = 0
+        for context_len, maximum in zip(context_lens, self.max_context_lens):
+            request_pages.append(permutation[offset : offset + context_len])
+            offset += maximum + 17
+
+        selected_physical = []
+        row_indptr = [0]
+        row_indices = []
+        row = 0
+        for width, context_len, pages in zip(widths, context_lens, request_pages):
+            for token_index in range(width):
+                causal_bound = max(context_len - width + token_index + 1, 0)
+                selected_count = min(causal_bound, self.topk)
+                if selected_count:
+                    logical = torch.randperm(
+                        causal_bound, generator=cpu_generator, device="cpu"
+                    )[:selected_count]
+                    physical = torch.tensor(
+                        [pages[index] for index in logical.tolist()],
+                        dtype=torch.int32,
+                        device=self.q.device,
+                    )
+                else:
+                    physical = torch.empty(0, dtype=torch.int32, device=self.q.device)
+                selected_physical.append(physical)
+                row_indices.extend(physical.cpu().tolist())
+                row_indptr.append(len(row_indices))
+                row += 1
+        while row < self.max_rows:
+            selected_physical.append(
+                torch.empty(0, dtype=torch.int32, device=self.q.device)
+            )
+            row_indptr.append(len(row_indices))
+            row += 1
+
+        self.kv_indptr.copy_(
+            torch.tensor(row_indptr, dtype=torch.int32, device=self.q.device)
+        )
+        self.kv_indices.fill_(-1)
+        if row_indices:
+            self.kv_indices[: len(row_indices)].copy_(
+                torch.tensor(row_indices, dtype=torch.int32, device=self.q.device)
+            )
+        self.output.fill_(self.sentinel)
+        self.live_rows = live_rows
+        self.selected_physical = tuple(selected_physical)
+        return self
+
+    @property
+    def selected_count(self):
+        return int(self.kv_indptr[self.max_rows].item())
+
+
+def build_adaptive_mla_fixture(
+    widths,
+    context_lens,
+    num_heads,
+    topk,
+    max_rows=32,
+    seed=1,
+    max_context_lens=None,
+):
+    if max_context_lens is None:
+        max_context_lens = context_lens
+    fixture = AdaptiveMLADecodeFixture.create(
+        max_rows=max_rows,
+        num_heads=num_heads,
+        topk=topk,
+        max_context_lens=max_context_lens,
+    )
+    return fixture.load(widths, context_lens, seed)
+
+
+def torch_mla_varlen_sparse_reference(fixture):
+    output = torch.full_like(fixture.output, fixture.sentinel)
+    q = fixture.q.float() * fixture.q_scale.float()
+    kv = fixture.kv_buffer[:, 0].float() * fixture.kv_scale.float()
+    sm_scale = 1.0 / (576**0.5)
+    for row in range(fixture.live_rows):
+        physical = fixture.selected_physical[row]
+        if physical.numel() == 0:
+            output[row].zero_()
+            continue
+        row_kv = kv.index_select(0, physical.to(torch.int64))
+        scores = torch.matmul(q[row], row_kv.transpose(0, 1)) * sm_scale
+        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        output[row].copy_(torch.matmul(probabilities, row_kv[:, :512]).to(output.dtype))
+    return output
+
+
+@dataclass
+class _AdaptiveCandidate:
+    name: str
+    invoke: object
+    scratch_bytes: object
+    checks_empty_rows: bool
+    graph_native: bool
+
+
+def _aiter_flattened_candidate(fixture, num_kv_splits):
+    selected_count = fixture.selected_count
+    split_indptr = torch.arange(
+        0,
+        (fixture.live_rows + 1) * num_kv_splits,
+        num_kv_splits,
+        dtype=torch.int32,
+        device=fixture.q.device,
+    )
+
+    def invoke():
+        live_qo_indptr = fixture.qo_indptr[: fixture.live_rows + 1]
+        live_kv_indptr = fixture.kv_indptr[: fixture.live_rows + 1]
+        aiter.mla.mla_decode_fwd(
+            fixture.q[: fixture.live_rows],
+            fixture.kv_buffer.view(-1, 1, 1, 576),
+            fixture.output[: fixture.live_rows],
+            live_qo_indptr,
+            live_kv_indptr,
+            fixture.kv_indices[:selected_count],
+            fixture.kv_last_page_lens[: fixture.live_rows],
+            1,
+            1,
+            1,
+            1.0 / (576**0.5),
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=split_indptr,
+            q_scale=fixture.q_scale,
+            kv_scale=fixture.kv_scale,
+            causal=False,
+        )
+        return fixture.output
+
+    def scratch_bytes():
+        return fixture.live_rows * num_kv_splits * fixture.num_heads * 513 * 4 * 2
+
+    return _AdaptiveCandidate(
+        name="aiter_flattened_asm_decode_merge",
+        invoke=invoke,
+        scratch_bytes=scratch_bytes,
+        checks_empty_rows=False,
+        graph_native=False,
+    )
+
+
+def _production_adaptive_candidate(fixture, num_kv_splits):
+    try:
+        module = importlib.import_module("aiter.ops.flydsl.mla_decode_varlen")
+    except ModuleNotFoundError as error:
+        if error.name == "aiter.ops.flydsl.mla_decode_varlen":
+            return None
+        raise
+    function = module.mla_decode_varlen
+    factory = getattr(module, "create_mla_decode_varlen_workspace", None)
+    workspace = (
+        factory(
+            fixture.q,
+            fixture.kv_buffer,
+            fixture.output,
+            num_kv_splits=num_kv_splits,
+        )
+        if factory is not None
+        else None
+    )
+
+    def invoke():
+        function(
+            fixture.q,
+            fixture.kv_buffer,
+            fixture.output,
+            fixture.query_start_loc,
+            fixture.kv_indptr,
+            fixture.kv_indices,
+            sm_scale=1.0 / (576**0.5),
+            q_scale=fixture.q_scale,
+            kv_scale=fixture.kv_scale,
+            workspace=workspace,
+            num_kv_splits=num_kv_splits,
+        )
+        return fixture.output
+
+    def scratch_bytes():
+        estimator = getattr(module, "mla_decode_varlen_scratch_bytes", None)
+        if estimator is None:
+            return 0
+        return int(estimator(workspace))
+
+    return _AdaptiveCandidate(
+        name="adaptive_varlen",
+        invoke=invoke,
+        scratch_bytes=scratch_bytes,
+        checks_empty_rows=True,
+        graph_native=True,
+    )
+
+
+def _validate_adaptive_output(fixture, reference, candidate, expected):
+    if candidate.checks_empty_rows:
+        checked_rows = torch.arange(fixture.live_rows, device=fixture.q.device)
+    else:
+        checked_rows = torch.tensor(
+            [
+                row
+                for row in range(fixture.live_rows)
+                if fixture.selected_physical[row].numel()
+            ],
+            dtype=torch.int64,
+            device=fixture.q.device,
+        )
+    err = checkAllclose(
+        reference.index_select(0, checked_rows).float(),
+        candidate.index_select(0, checked_rows).float(),
+        msg=expected,
+    )
+    if not torch.equal(candidate[fixture.live_rows :], reference[fixture.live_rows :]):
+        raise AssertionError(f"{expected}: padded output rows were modified")
+    return err
+
+
+def _adaptive_work(fixture):
+    flops = fixture.selected_count * fixture.num_heads * 2 * (576 + 512)
+    io_bytes = (
+        fixture.live_rows * fixture.num_heads * 576
+        + fixture.selected_count * 576
+        + fixture.live_rows * fixture.num_heads * 512 * 2
+        + fixture.selected_count * 4
+        + fixture.kv_indptr.nbytes
+        + fixture.query_start_loc.nbytes
+        + fixture.q_scale.nbytes
+        + fixture.kv_scale.nbytes
+    )
+    return flops, io_bytes
+
+
+def _run_graph_replay(candidate, fixture):
+    replay_names = ("zero", "mixed", "grow", "ragged", "mixed")
+    widths, context_lens = ADAPTIVE_SCENARIOS["zero"]
+    fixture.load(widths, context_lens, 701)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        candidate.invoke()
+    side_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    fixture.output.fill_(fixture.sentinel)
+    with torch.cuda.graph(graph):
+        candidate.invoke()
+    previous = None
+    for replay_index, name in enumerate(replay_names):
+        widths, context_lens = ADAPTIVE_SCENARIOS[name]
+        fixture.load(widths, context_lens, 809 + replay_index)
+        reference = torch_mla_varlen_sparse_reference(fixture)
+        graph.replay()
+        torch.cuda.synchronize()
+        _validate_adaptive_output(
+            fixture,
+            reference,
+            fixture.output,
+            f"{candidate.name}: graph replay {name}",
+        )
+        current = fixture.output.clone()
+        if previous is not None and torch.equal(previous, current):
+            raise AssertionError(
+                "graph replay output did not change after input update"
+            )
+        previous = current
+    return 0
+
+
+@benchmark()
+def test_mla_varlen_adaptive(
+    scenario,
+    nhead,
+    topk,
+    max_rows,
+    num_kv_splits,
+):
+    widths, context_lens = ADAPTIVE_SCENARIOS[scenario]
+    max_context_lens = tuple(
+        max(values)
+        for values in zip(*(item[1] for item in ADAPTIVE_SCENARIOS.values()))
+    )
+    fixture = build_adaptive_mla_fixture(
+        widths,
+        context_lens,
+        nhead,
+        topk,
+        max_rows=max_rows,
+        seed=101,
+        max_context_lens=max_context_lens,
+    )
+    reference = torch_mla_varlen_sparse_reference(fixture)
+    candidates = {}
+    if all(fixture.selected_physical[row].numel() for row in range(fixture.live_rows)):
+        flattened = _aiter_flattened_candidate(fixture, num_kv_splits)
+        candidates[flattened.name] = flattened
+    adaptive = _production_adaptive_candidate(fixture, num_kv_splits)
+    if adaptive is not None:
+        candidates[adaptive.name] = adaptive
+
+    flops, io_bytes = _adaptive_work(fixture)
+    ret = {
+        "gfx": get_gfx(),
+        "rows": fixture.live_rows,
+        "selected": fixture.selected_count,
+        "adaptive available": adaptive is not None,
+    }
+    for name, candidate in candidates.items():
+        fixture.output.fill_(fixture.sentinel)
+        output, microseconds = run_perftest(
+            candidate.invoke,
+            num_warmup=10,
+            num_iters=51,
+            use_cuda_event=True,
+        )
+        err = _validate_adaptive_output(
+            fixture, reference, output, f"{name}: independent fp32 oracle"
+        )
+        first = output.clone()
+        fixture.output.fill_(fixture.sentinel)
+        candidate.invoke()
+        torch.cuda.synchronize()
+        if not torch.equal(first, fixture.output):
+            raise AssertionError(f"{name}: repeated invocation is not bitwise stable")
+        traffic_bytes = io_bytes + candidate.scratch_bytes()
+        ret[f"{name} us"] = microseconds
+        ret[f"{name} TFLOPS"] = flops / microseconds / 1e6
+        ret[f"{name} TB/s"] = traffic_bytes / microseconds / 1e6
+        ret[f"{name} err"] = err
+
+    if adaptive is not None:
+        ret["adaptive_varlen graph err"] = _run_graph_replay(adaptive, fixture)
+    return ret
+
+
+def main():
+    if get_gfx() not in ("gfx942", "gfx950"):
+        aiter.logger.warning(
+            "adaptive sparse MLA unsupported on %s; skipping", get_gfx()
+        )
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="adaptive ragged sparse MLA decode correctness and performance",
+    )
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        nargs="*",
+        choices=tuple(ADAPTIVE_SCENARIOS),
+        default=["mixed", "zero", "ragged"],
+    )
+    parser.add_argument("-n", "--nhead", type=int, nargs="*", default=[16, 32, 64, 128])
+    parser.add_argument("--topk", type=int, nargs="*", default=[128, 2048])
+    parser.add_argument("--max-rows", type=int, nargs="*", default=[32])
+    parser.add_argument("--num-kv-splits", type=int, nargs="*", default=[8])
+    args = parser.parse_args()
+
+    rows = []
+    for scenario, nhead, topk, max_rows, num_kv_splits in itertools.product(
+        args.scenarios,
+        args.nhead,
+        args.topk,
+        args.max_rows,
+        args.num_kv_splits,
+    ):
+        rows.append(
+            test_mla_varlen_adaptive(
+                scenario,
+                nhead,
+                topk,
+                max_rows,
+                num_kv_splits,
+            )
+        )
+    dataframe = pd.DataFrame(rows)
+    aiter.logger.info(
+        "adaptive sparse MLA summary (markdown):\n%s",
+        dataframe.to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
