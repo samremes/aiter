@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Native eight-head sparse MLA decode for gfx950.
 
 The product path uses one eight-wave CTA per ``(query, split)`` task.  Each
@@ -28,7 +31,6 @@ NUM_WARPS = 8
 WARP_SIZE = 64
 NUM_THREADS = NUM_WARPS * WARP_SIZE
 Q_DWORDS = NUM_HEADS * QK_DIM // 4
-KV_ROW_DWORDS = QK_DIM // 4
 KV_COL_BLOCK = 64
 KV_COL_BLOCKS = QK_DIM // KV_COL_BLOCK
 KV_SUB_ROWS = 4
@@ -70,7 +72,7 @@ def kn_mla_decode_varlen_h8_fp8(
     q_scale: fx.Tensor,
     kv_scale: fx.Tensor,
     softmax_scale: fx.Float32,
-    output_mode: fx.Constexpr,
+    has_partials: fx.Constexpr,
     num_workers: fx.Constexpr,
 ):
     query_rsrc = buffer_ops.create_buffer_resource(query)
@@ -328,7 +330,7 @@ def kn_mla_decode_varlen_h8_fp8(
                     _inline_asm_void(
                         [lds_base, _raw(fx.Int32(source_byte)), _raw(kv_rsrc)],
                         asm_string,
-                        "s,v,s",
+                        "s,v,s,~{m0}",
                     )
                 else:
                     _store_i32(target_base + lane * 4, zero_i32)
@@ -598,7 +600,7 @@ def kn_mla_decode_varlen_h8_fp8(
                         fx.Float32(values[item]) * reciprocal * probability_scale_recip
                     )
                     value_column = value_base + item
-                    if const_expr(output_mode == 0):
+                    if const_expr(not has_partials):
                         output_offset = (
                             query_row * NUM_HEADS + head
                         ) * V_DIM + value_column
@@ -627,7 +629,7 @@ def kn_mla_decode_varlen_h8_fp8(
                                 result, split_output_rsrc, output_offset
                             )
 
-        if const_expr(output_mode != 0):
+        if const_expr(has_partials):
             if (wave == 0) & (lane_group == 0) & (head < NUM_HEADS):
                 write_lse = partial_location >= 0
                 if write_lse:
@@ -652,7 +654,7 @@ def launch_mla_decode_varlen_h8(
     q_scale: fx.Tensor,
     kv_scale: fx.Tensor,
     softmax_scale: fx.Float32,
-    output_mode: fx.Constexpr,
+    has_partials: fx.Constexpr,
     num_workers: fx.Constexpr,
     stream: fx.Stream = fx.Stream(None),
 ):
@@ -668,7 +670,7 @@ def launch_mla_decode_varlen_h8(
         q_scale,
         kv_scale,
         softmax_scale,
-        output_mode,
+        has_partials,
         num_workers,
     ).launch(
         grid=(num_workers, 1, 1),
@@ -703,6 +705,7 @@ def kn_build_compact_varlen_work_h8(
     live_rows = fx.Int32(
         buffer_ops.buffer_load(qsl_rsrc, num_requests, vec_width=1, dtype=T.i32)
     )
+    live_rows = (live_rows > max_rows).select(fx.Int32(max_rows), live_rows)
     if tid == 0:
         buffer_ops.buffer_store(fx.Int32(0), header_rsrc, 0)
         buffer_ops.buffer_store(live_rows, header_rsrc, 1)

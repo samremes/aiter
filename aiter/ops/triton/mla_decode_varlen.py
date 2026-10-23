@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -43,15 +46,12 @@ def _mla_decode_varlen_stage1(
         heads = head_block * block_h + tl.arange(0, block_h)
         latent = tl.arange(0, 512)
         head_mask = heads < num_heads
-        if row_length == 0:
-            if direct_output:
-                tl.store(
-                    output
-                    + (row * num_heads + heads[:, None]) * 512
-                    + latent[None, :],
-                    0.0,
-                    mask=head_mask[:, None],
-                )
+        if direct_output and row_length == 0:
+            tl.store(
+                output + (row * num_heads + heads[:, None]) * 512 + latent[None, :],
+                0.0,
+                mask=head_mask[:, None],
+            )
         if split_begin < split_end:
             rope = tl.arange(0, 64)
             q_base = (row * num_heads + heads[:, None]) * 576
@@ -72,9 +72,9 @@ def _mla_decode_varlen_stage1(
             for tile_begin in range(split_begin, split_end, block_n):
                 positions = tile_begin + tl.arange(0, block_n)
                 token_mask = positions < split_end
-                physical = tl.load(
-                    kv_indices + positions, mask=token_mask, other=0
-                ).to(tl.int64)
+                physical = tl.load(kv_indices + positions, mask=token_mask, other=0).to(
+                    tl.int64
+                )
                 k_latent = tl.load(
                     kv + physical[None, :] * 576 + latent[:, None],
                     mask=token_mask[None, :],
@@ -105,25 +105,20 @@ def _mla_decode_varlen_stage1(
                 accumulator += tl.dot(
                     probabilities.to(tl.bfloat16), values.to(tl.bfloat16)
                 )
-                denominator = denominator * old_weight + tl.sum(
-                    probabilities, axis=1
-                )
+                denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
                 maximum = next_maximum
 
             result = accumulator / denominator[:, None] * scale_v
             if direct_output:
                 tl.store(
-                    output
-                    + (row * num_heads + heads[:, None]) * 512
-                    + latent[None, :],
+                    output + (row * num_heads + heads[:, None]) * 512 + latent[None, :],
                     result,
                     mask=head_mask[:, None],
                 )
             else:
                 partial_base = (
-                    ((row * num_heads + heads[:, None]) * num_splits + split)
-                    * 512
-                )
+                    (row * num_heads + heads[:, None]) * num_splits + split
+                ) * 512
                 tl.store(
                     partial_output + partial_base + latent[None, :],
                     result,
@@ -171,9 +166,7 @@ def _mla_decode_varlen_stage2(
                     next_maximum = tl.maximum(maximum, split_lse)
                     old_weight = tl.exp(maximum - next_maximum)
                     new_weight = tl.exp(split_lse - next_maximum)
-                    partial = tl.load(
-                        partial_output + offset * 512 + latent
-                    )
+                    partial = tl.load(partial_output + offset * 512 + latent)
                     accumulator = accumulator * old_weight + partial * new_weight
                     denominator = denominator * old_weight + new_weight
                     maximum = next_maximum
@@ -206,13 +199,9 @@ def create_mla_decode_varlen_workspace(
     if tuple(o.shape) != (max_rows, num_heads, 512):
         raise ValueError("`o` must have shape [max_rows, num_heads, 512]")
     partial_shape = (
-        (max_rows, num_heads, num_kv_splits, 512)
-        if num_kv_splits > 1
-        else (0,)
+        (max_rows, num_heads, num_kv_splits, 512) if num_kv_splits > 1 else (0,)
     )
-    lse_shape = (
-        (max_rows, num_heads, num_kv_splits) if num_kv_splits > 1 else (0,)
-    )
+    lse_shape = (max_rows, num_heads, num_kv_splits) if num_kv_splits > 1 else (0,)
     return MlaDecodeVarlenWorkspace(
         max_rows=max_rows,
         num_heads=num_heads,

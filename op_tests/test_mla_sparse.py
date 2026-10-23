@@ -901,18 +901,13 @@ def torch_mla_varlen_sparse_reference(fixture, sm_scale=None):
     return output
 
 
-def _adaptive_error_metrics(reference, output):
-    reference_fp32 = reference.float()
-    output_fp32 = output.float()
-    difference = output_fp32 - reference_fp32
-    finite = torch.isfinite(output_fp32)
-    tolerance = 0.01 + 0.01 * reference_fp32.abs()
-    return {
-        "max_abs": difference.abs().max().item(),
-        "rms": difference.square().mean().sqrt().item(),
-        "mismatch": int((difference.abs() > tolerance).sum().item()),
-        "nonfinite": int((~finite).sum().item()),
-    }
+def _assert_adaptive_close(reference, output, msg):
+    err = checkAllclose(
+        reference.float(), output.float(), atol=0.01, rtol=0.01, msg=msg
+    )
+    if err != 0:
+        raise AssertionError(f"{msg}: error ratio {err:.6f}")
+    return err
 
 
 def _build_adaptive_cancellation_fixture(num_heads):
@@ -973,11 +968,6 @@ class _AdaptiveCandidate:
     name: str
     invoke: object
     scratch_bytes: object
-    checks_empty_rows: bool
-    graph_native: bool
-    executed_heads: int
-    executed_qk_heads: int
-    executed_pv_heads: int
     executed_splits: object
 
 
@@ -1028,61 +1018,24 @@ def _adaptive_candidate(fixture, num_kv_splits, module_name, candidate_name):
             return workspace.stage_splits
         return num_kv_splits
 
-    if candidate_name == "flydsl_adaptive" and fixture.num_heads == 8:
-        executed_qk_heads = fixture.num_heads
-        executed_pv_heads = fixture.num_heads
-    elif candidate_name == "flydsl_adaptive":
-        value_groups = 8 // (min(fixture.num_heads, 64) // 16)
-        executed_qk_heads = fixture.num_heads * value_groups
-        executed_pv_heads = 2 * fixture.num_heads
-    else:
-        executed_qk_heads = fixture.num_heads
-        executed_pv_heads = fixture.num_heads
-
     return _AdaptiveCandidate(
         name=candidate_name,
         invoke=invoke,
         scratch_bytes=scratch_bytes,
-        checks_empty_rows=True,
-        graph_native=True,
-        executed_heads=fixture.num_heads,
-        executed_qk_heads=executed_qk_heads,
-        executed_pv_heads=executed_pv_heads,
         executed_splits=executed_splits,
     )
 
 
-def _validate_adaptive_output(fixture, reference, output, candidate, expected):
-    if candidate.checks_empty_rows:
-        checked_rows = torch.arange(fixture.live_rows, device=fixture.q.device)
-    else:
-        checked_rows = torch.tensor(
-            [
-                row
-                for row in range(fixture.live_rows)
-                if fixture.selected_physical[row].numel()
-            ],
-            dtype=torch.int64,
-            device=fixture.q.device,
-        )
-    err = checkAllclose(
-        reference.index_select(0, checked_rows).float(),
-        output.index_select(0, checked_rows).float(),
-        msg=expected,
-    )
-    if err != 0:
-        raise AssertionError(f"{expected}: error ratio {err:.6f}")
+def _validate_adaptive_output(fixture, reference, output, expected):
+    live = slice(0, fixture.live_rows)
+    err = _assert_adaptive_close(reference[live], output[live], expected)
     request_offsets = fixture.query_start_loc.cpu().tolist()
     for request_index, (begin, end) in enumerate(itertools.pairwise(request_offsets)):
-        request_err = checkAllclose(
-            reference[begin:end].float(),
-            output[begin:end].float(),
-            msg=f"{expected}: request {request_index}",
+        _assert_adaptive_close(
+            reference[begin:end],
+            output[begin:end],
+            f"{expected}: request {request_index}",
         )
-        if request_err != 0:
-            raise AssertionError(
-                f"{expected}: request {request_index} error ratio " f"{request_err:.6f}"
-            )
     if not torch.equal(output[fixture.live_rows :], reference[fixture.live_rows :]):
         raise AssertionError(f"{expected}: padded output rows were modified")
     return err
@@ -1219,7 +1172,6 @@ def _run_graph_replay(candidate, fixture):
             fixture,
             reference,
             fixture.output,
-            candidate,
             f"{candidate.name}: graph replay {name}",
         )
         current = fixture.output.clone()
@@ -1320,18 +1272,15 @@ def test_mla_varlen_adaptive(
             fixture,
             reference,
             output,
-            candidate,
             f"{name}: independent fp32 oracle",
         )
         first = output.clone()
         fixture.output.fill_(fixture.sentinel)
         candidate.invoke()
         torch.cuda.synchronize()
-        repeated_metrics = _adaptive_error_metrics(reference, fixture.output)
-        if repeated_metrics["mismatch"] or repeated_metrics["nonfinite"]:
-            raise AssertionError(
-                f"{name}: repeated invocation failed oracle: {repeated_metrics}"
-            )
+        _assert_adaptive_close(
+            reference, fixture.output, f"{name}: repeated invocation oracle"
+        )
         ret[f"{name} repeat equal"] = torch.equal(first, fixture.output)
         graph_times = {
             packed_launches: _run_packed_graph_perftest(candidate, packed_launches)
@@ -1346,9 +1295,6 @@ def test_mla_varlen_adaptive(
         ret[f"{name} TB/s"] = traffic_bytes / microseconds / 1e6
         ret[f"{name} bytes"] = traffic_bytes
         ret[f"{name} scratch allocation bytes"] = candidate.scratch_bytes()
-        ret[f"{name} executed heads"] = candidate.executed_heads
-        ret[f"{name} executed QK heads"] = candidate.executed_qk_heads
-        ret[f"{name} executed PV heads"] = candidate.executed_pv_heads
         ret[f"{name} executed splits"] = (
             candidate.executed_splits()
             if callable(candidate.executed_splits)
@@ -1426,12 +1372,12 @@ def _run_adaptive_multiwave_auto_checks(module):
             workspace.finalize_count.fill_(-1)
             graph.replay()
             torch.cuda.synchronize()
-            metrics = _adaptive_error_metrics(reference, fixture.output)
-            if metrics["mismatch"] or metrics["nonfinite"]:
-                raise AssertionError(
-                    f"multiwave auto R{live_rows} empty={empty_context} "
-                    f"replay={replay_index} failed: {metrics}"
-                )
+            _assert_adaptive_close(
+                reference,
+                fixture.output,
+                f"multiwave auto R{live_rows} empty={empty_context} "
+                f"replay={replay_index}",
+            )
             if not torch.equal(fixture.output[live_rows:], reference[live_rows:]):
                 raise AssertionError("multiwave auto graph modified output padding")
             splits = workspace.row_splits[:live_rows].cpu()
@@ -1547,22 +1493,11 @@ def _run_adaptive_validation_checks(module):
                 num_kv_splits=splits,
             )
             torch.cuda.synchronize()
-            metrics = _adaptive_error_metrics(
-                cancellation_reference, cancellation_fixture.output
+            _assert_adaptive_close(
+                cancellation_reference,
+                cancellation_fixture.output,
+                f"adaptive cancellation H{cancellation_heads} S{splits}",
             )
-            aiter.logger.info(
-                "adaptive cancellation H%d S%d: max_abs=%g rms=%g mismatch=%d nonfinite=%d",
-                cancellation_heads,
-                splits,
-                metrics["max_abs"],
-                metrics["rms"],
-                metrics["mismatch"],
-                metrics["nonfinite"],
-            )
-            if metrics["mismatch"] or metrics["nonfinite"]:
-                raise AssertionError(
-                    f"adaptive cancellation H{cancellation_heads} S{splits} failed: {metrics}"
-                )
 
     for dominant_heads in (8, 16):
         dominant_fixture = _build_adaptive_dominant_tail_fixture(dominant_heads)
@@ -1589,19 +1524,11 @@ def _run_adaptive_validation_checks(module):
             num_kv_splits=1,
         )
         torch.cuda.synchronize()
-        metrics = _adaptive_error_metrics(dominant_reference, dominant_fixture.output)
-        aiter.logger.info(
-            "adaptive dominant tail H%d S1: max_abs=%g rms=%g mismatch=%d nonfinite=%d",
-            dominant_heads,
-            metrics["max_abs"],
-            metrics["rms"],
-            metrics["mismatch"],
-            metrics["nonfinite"],
+        _assert_adaptive_close(
+            dominant_reference,
+            dominant_fixture.output,
+            f"adaptive dominant tail H{dominant_heads} S1",
         )
-        if metrics["mismatch"] or metrics["nonfinite"]:
-            raise AssertionError(
-                f"adaptive dominant tail H{dominant_heads} S1 failed: {metrics}"
-            )
 
     canonical_lengths = (1, 31, 32, 63, 64, 65, 128, 256, 384, 512, 1024, 2048)
     for mapping, num_heads, splits, seed in itertools.product(
@@ -1640,24 +1567,11 @@ def _run_adaptive_validation_checks(module):
             num_kv_splits=splits,
         )
         torch.cuda.synchronize()
-        metrics = _adaptive_error_metrics(canonical_reference, canonical_fixture.output)
-        aiter.logger.info(
-            "adaptive canonical mapping=%s H%d S%d seed=%d: "
-            "max_abs=%g rms=%g mismatch=%d nonfinite=%d",
-            mapping,
-            num_heads,
-            splits,
-            seed,
-            metrics["max_abs"],
-            metrics["rms"],
-            metrics["mismatch"],
-            metrics["nonfinite"],
+        _assert_adaptive_close(
+            canonical_reference,
+            canonical_fixture.output,
+            f"adaptive canonical mapping={mapping} H{num_heads} S{splits} seed={seed}",
         )
-        if metrics["mismatch"] or metrics["nonfinite"]:
-            raise AssertionError(
-                "adaptive canonical gate failed: "
-                f"mapping={mapping} H{num_heads} S{splits} seed={seed} {metrics}"
-            )
 
     prepared_fixture = build_adaptive_mla_fixture(
         (1, 2, 4, 5, 8),
@@ -1700,11 +1614,9 @@ def _run_adaptive_validation_checks(module):
 
     prepared_invoke()
     torch.cuda.synchronize()
-    prepared_metrics = _adaptive_error_metrics(prepared_reference, prepared_output)
-    if prepared_metrics["mismatch"] or prepared_metrics["nonfinite"]:
-        raise AssertionError(
-            f"prepared independent-buffer route failed: {prepared_metrics}"
-        )
+    _assert_adaptive_close(
+        prepared_reference, prepared_output, "prepared independent-buffer route"
+    )
     prepared_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(prepared_graph):
         prepared_invoke()
@@ -1715,11 +1627,11 @@ def _run_adaptive_validation_checks(module):
         prepared_output.fill_(prepared_fixture.sentinel)
         prepared_graph.replay()
         torch.cuda.synchronize()
-        replay_metrics = _adaptive_error_metrics(prepared_reference, prepared_output)
-        if replay_metrics["mismatch"] or replay_metrics["nonfinite"]:
-            raise AssertionError(
-                f"prepared graph replay {replay_index} failed: {replay_metrics}"
-            )
+        _assert_adaptive_close(
+            prepared_reference,
+            prepared_output,
+            f"prepared graph replay {replay_index}",
+        )
 
     for graph_heads in (8, 128):
         graph_fixture = AdaptiveMLADecodeFixture.create(
@@ -1774,11 +1686,11 @@ def _run_adaptive_validation_checks(module):
                 reference = torch_mla_varlen_sparse_reference(graph_fixture)
                 graph.replay()
                 torch.cuda.synchronize()
-                metrics = _adaptive_error_metrics(reference, graph_fixture.output)
-                if metrics["mismatch"] or metrics["nonfinite"]:
-                    raise AssertionError(
-                        f"public graph H{graph_heads} {scenario} S{expected_splits} failed: {metrics}"
-                    )
+                _assert_adaptive_close(
+                    reference,
+                    graph_fixture.output,
+                    f"public graph H{graph_heads} {scenario} S{expected_splits}",
+                )
                 if not torch.equal(
                     graph_fixture.output[graph_fixture.live_rows :],
                     reference[graph_fixture.live_rows :],
@@ -1794,13 +1706,11 @@ def _run_adaptive_validation_checks(module):
                     )
                     graph.replay()
                     torch.cuda.synchronize()
-                    repeated_metrics = _adaptive_error_metrics(
-                        repeated_reference, graph_fixture.output
+                    _assert_adaptive_close(
+                        repeated_reference,
+                        graph_fixture.output,
+                        f"public graph H{graph_heads} S{expected_splits} repeated replay",
                     )
-                    if repeated_metrics["mismatch"] or repeated_metrics["nonfinite"]:
-                        raise AssertionError(
-                            f"public graph H{graph_heads} S{expected_splits} repeated replay failed: {repeated_metrics}"
-                        )
                 previous = current
 
 
@@ -1823,7 +1733,13 @@ def main():
         choices=tuple(ADAPTIVE_SCENARIOS),
         default=["mixed", "zero", "ragged", "empty_batch"],
     )
-    parser.add_argument("-n", "--nhead", type=str, nargs="*", default=None)
+    parser.add_argument(
+        "--adaptive-nhead",
+        type=int,
+        nargs="*",
+        default=[8, 16, 32, 64, 128],
+        help="head counts for --modes adaptive",
+    )
     parser.add_argument("--topk", type=int, nargs="*", default=[128, 2048])
     parser.add_argument("--max-rows", type=int, nargs="*", default=[32])
     parser.add_argument("--num-kv-splits", type=int, nargs="*", default=[16])
@@ -1835,24 +1751,67 @@ def main():
         choices=("page64", "token_shuffle"),
         default=["page64"],
     )
-    parser.add_argument("-k", "--kv_lora_rank", type=int, default=512)
-    parser.add_argument("-qn", "--qk_nope_head_dim", type=int, default=128)
-    parser.add_argument("-qr", "--qk_rope_head_dim", type=int, default=64)
-    parser.add_argument("-vh", "--v_head_dim", type=int, default=512)
-    parser.add_argument("-blk", "--block_size", type=int, default=1)
+    parser.add_argument(
+        "-k",
+        "--kv_lora_rank",
+        type=int,
+        default=512,
+        help="""kv lora rank.
+        e.g.: -k 512""",
+    )
+    parser.add_argument(
+        "-qn",
+        "--qk_nope_head_dim",
+        type=int,
+        default=128,
+        help="""qk nope head dim.
+        e.g.: -qn 512""",
+    )
+    parser.add_argument(
+        "-qr",
+        "--qk_rope_head_dim",
+        type=int,
+        default=64,
+        help="""qk rope head dim.
+        e.g.: -qr 64""",
+    )
+    parser.add_argument(
+        "-vh",
+        "--v_head_dim",
+        type=int,
+        default=512,
+        help="""v head dim.
+        e.g.: -vh 512""",
+    )
+    parser.add_argument(
+        "-blk",
+        "--block_size",
+        type=int,
+        default=1,
+        help="""Block size.
+        e.g.: -blk 1""",
+    )
     parser.add_argument(
         "-d",
         "--dtype",
         type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
         nargs="*",
-        default=[dtypes.bf16, dtypes.fp8],
+        default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+        metavar="{bf16, fp8}",
+        help="""Data type of Q.
+        e.g.: -d bf16""",
     )
     parser.add_argument(
         "-kvd",
         "--kv_dtype",
         type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
         nargs="*",
-        default=[dtypes.bf16, dtypes.fp8],
+        default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+        metavar="{bf16, fp8}",
+        help="""Data type of KV.
+        e.g.: -kvd bf16""",
     )
     parser.add_argument(
         "-c",
@@ -1860,6 +1819,8 @@ def main():
         type=int,
         nargs="*",
         default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+        help="""Context length.
+        e.g.: -c 21""",
     )
     parser.add_argument(
         "-b",
@@ -1867,11 +1828,33 @@ def main():
         type=int,
         nargs="*",
         default=[1, 3, 5, 16, 32, 64, 128, 256],
+        help="""Batch size.
+        e.g.: -b 16""",
     )
     parser.add_argument(
-        "-ms", "--max_split_per_batch", type=int, nargs="*", default=[32]
+        "-n",
+        "--nhead",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(16, 2), (48, 1), (128, 2)],
+        help="""Number of heads.
+        e.g.: -n 16,1""",
     )
-    parser.add_argument("--varlen", action="store_true")
+    parser.add_argument(
+        "-ms",
+        "--max_split_per_batch",
+        type=int,
+        nargs="*",
+        default=[32],
+        help="""kv seqlens max split num for per batch.
+        e.g.: -ms 32""",
+    )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="""variable kv seqlens per batch. Default: False.
+        --varlen # True""",
+    )
     args = parser.parse_args()
 
     if "adaptive" in args.modes:
@@ -1880,11 +1863,6 @@ def main():
             aiter.logger.warning("%s; skipping adaptive suite", unavailable_reason)
         else:
             _run_adaptive_validation_checks(adaptive_module)
-            adaptive_heads = (
-                [8, 16, 32, 64, 128]
-                if args.nhead is None
-                else [int(value) for value in args.nhead]
-            )
             rows = []
             for (
                 scenario,
@@ -1896,7 +1874,7 @@ def main():
                 mapping,
             ) in itertools.product(
                 args.scenarios,
-                adaptive_heads,
+                args.adaptive_nhead,
                 args.topk,
                 args.max_rows,
                 args.num_kv_splits,
@@ -1921,12 +1899,7 @@ def main():
             )
 
     if "legacy" in args.modes:
-        legacy_heads = (
-            [(16, 2), (48, 1), (128, 2)]
-            if args.nhead is None
-            else [dtypes.str2tuple(value) for value in args.nhead]
-        )
-        for nhead, decode_qlen in legacy_heads:
+        for nhead, decode_qlen in args.nhead:
             rows = []
             for (
                 dtype,

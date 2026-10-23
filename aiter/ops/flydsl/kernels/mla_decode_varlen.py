@@ -1,12 +1,22 @@
-"""FlyDSL MLA decode kernel (nhead=128, fp8 Q, fp8 KV, bf16 output).
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# ruff: noqa: B023, B008
+# B023: closures in the traced work loop are defined and called within the same
+# loop body, so loop-variable late binding does not apply.
+# B008: ``fx.Stream`` defaults are the FlyDSL launcher convention.
 
-Transplanted from csrc/kernels/mla/hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh.
-The gfx950 path from mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh is folded
-into this module as an arch-dispatched branch in the same kernel.
+"""FlyDSL MLA decode kernel (fp8 Q, fp8 KV, bf16 output) for 16 to 128 heads.
 
-Architecture: 8 warps / 512 threads, persistent-thread dispatch.
-Default path: BLOCK_N=32, software V transpose through Vt LDS.
-gfx950 path: BLOCK_N=64, V3 KV LDS layout, ds_read_b64_tr_b8 for V.
+Derived from the FlyDSL reference kernel mla_fwd_decode_m16x8_fp8_fp8.py.
+The wrapper runs it on gfx950 only: BLOCK_N=64, V3 KV LDS layout and
+ds_read_b64_tr_b8 for V. The module also keeps the BLOCK_N=32 path with a
+software V transpose through Vt LDS, selected at import by the device arch.
+
+Architecture: 8 warps / 512 threads. Each CTA reads its work range from
+``work_indptr[2 * block_idx]`` and processes those ``work_info_set`` entries in
+order. A CTA covers up to 64 heads in groups of 16; the warps that share a head
+group split the 512 value columns and each recomputes that group's QK.
 
 NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 ``fx.Constexpr`` detection in the FlyDSL AST rewriter.
@@ -35,18 +45,15 @@ def _is_gfx950_arch(arch: str) -> bool:
 # ---------------------------------------------------------------------------
 # Compile-time constants (mirroring HkMlaDecodeFwdTraits)
 # ---------------------------------------------------------------------------
-NUM_QO_HEADS: int = 128
-NUM_KV_HEADS: int = 1
 KV_LORA_RANK: int = 512
 QK_NOPE_HEAD_DIM: int = KV_LORA_RANK  # 512
 QK_ROPE_HEAD_DIM: int = 64
 QK_HEAD_DIM: int = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 576
 V_HEAD_DIM: int = KV_LORA_RANK  # 512
-PAGE_SIZE: int = 1
 NUM_WARPS: int = 8
 WARP_SIZE: int = 64
 NUM_THREADS: int = NUM_WARPS * WARP_SIZE  # 512
-BLOCK_M: int = 128  # == NUM_QO_HEADS
+BLOCK_M: int = 128
 IS_GFX950: bool = _is_gfx950_arch(get_rocm_arch())
 BLOCK_N: int = 64 if IS_GFX950 else 32
 BLOCK_K: int = 32
@@ -161,7 +168,6 @@ V3_KV_BYTES_PER_BLOCK: int = (
     V3_KV_BYTES_PER_2SUB_PADDED * V3_KV_NUM_2SUBS
 )  # 264 * 16 = 4224
 V3_SZ_LDS_KV: int = V3_KV_BYTES_PER_BLOCK * KV_NUM_BLOCKS  # 4224 * 9 = 38016
-V3_KV_NUM_ROWS_PER_WARP: int = V3_KV_SUB_BLOCK_ROWS * 2  # 8 phys rows per warp slot
 V3_KV_NUM_COL_STRIPS: int = KV_NUM_COLS // V3_KV_SUB_BLOCK_COLS  # 2
 V3_KV_NUM_WARPS_PER_COL: int = (
     NUM_WARPS // V3_KV_NUM_COL_STRIPS
@@ -328,15 +334,11 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     num_heads: fx.Constexpr,
     direct_output: fx.Constexpr,
 ):
-    """MLA decode forward kernel (nhead=128, fp8/fp8 -> bf16).
+    """MLA decode forward kernel (16 to 128 heads, fp8/fp8 -> bf16).
 
-    Persistent-thread kernel: each workgroup picks up work items
-    from ``work_indptr`` / ``work_info_set`` and processes them sequentially.
+    Each workgroup processes the work items in its ``work_indptr`` range of
+    ``work_info_set`` sequentially.
     """
-    _STUB_EARLY_RETURN = False  # Set True to skip all kernel body for testing launch
-    if const_expr(_STUB_EARLY_RETURN):
-        return
-
     # ---- Types ----
     fm_fast = arith.FastMathFlags.fast
 
@@ -608,7 +610,9 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 "s_nop 0\n"
                 f"buffer_load_dword $1, $2, 0 offen offset:{col_off_imm} lds"
             )
-            _inline_asm_void([lds_base_sgpr, voff, _raw(kv_rsrc)], asm_str, "s,v,s")
+            _inline_asm_void(
+                [lds_base_sgpr, voff, _raw(kv_rsrc)], asm_str, "s,v,s,~{m0}"
+            )
 
         if const_expr(check_boundary is False):
             _emit_normal_load()
@@ -828,8 +832,8 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         """Butterfly max reduce across MFMA column groups (strides 32, 16)."""
         w = _f32(val)
         for sh in [32, 16]:
-            # Pinned: fx.maxnumf now inherits this launcher's fast_fp_math, and
-            # test_mla_decode.py aborts here so that widening is unverified.
+            # Pinned to ``contract``: the launcher-wide fast-math flags are not
+            # verified for this reduction.
             w = fx.maxnumf(
                 w, _shfl_xor_f32(w, sh), fastmath=arith.FastMathFlags.contract
             )
@@ -859,7 +863,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         # VRAM addressing: row = lane/4, col = (lane%4)*16
         # s_offset = warp * 16 * QK_HEAD_DIM * sizeof(fp8)
         # v_offset = (row * QK_HEAD_DIM + col) * sizeof(fp8)
-        # s_offset = warp * 16 * QK_HEAD_DIM + qo_start * NUM_QO_HEADS * QK_HEAD_DIM
+        # s_offset = head_group * 16 * QK_HEAD_DIM + qo_start * num_heads * QK_HEAD_DIM
         s_offset = query_head_group * (16 * QK_HEAD_DIM) + _idx(qo_start_i32) * (
             num_heads * QK_HEAD_DIM
         )
