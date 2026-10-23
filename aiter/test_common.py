@@ -52,6 +52,7 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    robust_multi_kernel=False,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -108,7 +109,11 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            avg = (
+                get_trace_perf_by_kernel(prof, num_iters)
+                if robust_multi_kernel
+                else get_trace_perf(prof, num_iters)
+            )
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -121,7 +126,11 @@ def perftest(
                     with_modules=True,
                 ) as prof:
                     run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
+                avg = (
+                    get_trace_perf_by_kernel(prof, num_iters)
+                    if robust_multi_kernel
+                    else get_trace_perf(prof, num_iters)
+                )
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
             return data, avg
@@ -212,6 +221,7 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    robust_multi_kernel=False,
     **kwargs,
 ):
     @perftest(
@@ -221,6 +231,7 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        robust_multi_kernel=robust_multi_kernel,
     )
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
@@ -405,6 +416,61 @@ def get_trace_perf(prof, num_iters):
         pd.set_option("display.float_format", "{:,.1f}".format)
         logger.info(f"{df}")
     return df.at[avg_name, "device_time_sum"]
+
+
+def get_trace_perf_by_kernel(prof, num_iters):
+    """Sum independently filtered per-kernel means for multi-launch calls.
+
+    ``get_trace_perf`` groups the profiler's device events by adjacent row
+    number before applying its iteration-level IQR filter. Profiler event
+    order is not guaranteed to preserve launch-iteration boundaries, so that
+    method can remove different occurrence counts for different kernels in a
+    heterogeneous call. This variant filters each kernel identity separately
+    and then sums its mean cost times its occurrences per iteration.
+    """
+    assert num_iters > 1
+    rows = []
+    for event in prof.events():
+        if str(getattr(event, "device_type", "")).split(".")[-1] != "CUDA":
+            continue
+        rows.append(
+            (
+                getattr(event, "name", ""),
+                float(getattr(event, "self_device_time_total", 0.0)),
+            )
+        )
+    if not rows:
+        return 0
+
+    df = pd.DataFrame(rows, columns=["name", "device_us"])
+    total_us = 0.0
+    breakdown = []
+    for name, group in df.groupby("name", sort=False):
+        occurrences = len(group)
+        per_iter = max(1, round(occurrences / num_iters))
+        # Profiler setup leaves enough of a host-side gap for an idle GPU to
+        # fall back to a low DPM state. Discard ten occurrences per logical
+        # launch site so sub-millisecond kernels are measured after sclk ramps.
+        warm_occurrences = min(10 * per_iter, max(0, occurrences - per_iter))
+        samples = group["device_us"].iloc[warm_occurrences:].reset_index(drop=True)
+        if len(samples) > 30:
+            q1 = samples.quantile(0.25)
+            q3 = samples.quantile(0.75)
+            iqr = q3 - q1
+            samples = samples[
+                (samples >= q1 - 1.5 * iqr) & (samples <= q3 + 1.5 * iqr)
+            ]
+        if not samples.empty:
+            contribution = float(samples.mean()) * per_iter
+            total_us += contribution
+            breakdown.append((name, per_iter, contribution))
+    if int(os.environ.get("AITER_LOG_MORE", "0")):
+        for name, per_iter, contribution in breakdown:
+            logger.info(
+                f"{name}: {per_iter} occurrence(s), "
+                f"{contribution:.3f} us/iteration"
+            )
+    return total_us
 
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5

@@ -3,30 +3,63 @@
 
 """Correctness proof for packed-varlen group-max pruning and harvest."""
 
+import argparse
+import itertools
+
+import aiter
+import pandas as pd
 import pytest
 import torch
 
 pytest.importorskip("flydsl")
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.fp8_paged_mqa_group_max_topk import (
     GROUP_SIZE,
     flydsl_fp8_paged_mqa_group_harvest,
     flydsl_fp8_paged_mqa_group_max,
     flydsl_fp8_paged_mqa_group_max_topk,
+    flydsl_fp8_paged_mqa_logits_k_stationary,
     flydsl_fp8_paged_mqa_position_map,
     group_space_split_bounds,
+    plan_group_max_num_splits,
     torch_group_max_topk_prototype,
+)
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_fused_k2 import (
+    fused_k2_parts,
+    fused_k2_workspace_elems,
+)
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_group_harvest import (
+    launch_fp8_paged_mqa_group_harvest,
+    launch_fp8_paged_mqa_position_map,
+)
+from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_group_max import (
+    launch_fp8_paged_mqa_group_max,
 )
 from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     launch_fp8_paged_mqa_local_topk,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.topk_per_row_decode_persistent import (
+    build_topk_per_row_decode_one_workgroup_module,
+)
+from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.topk import _hip_top_k_per_row_decode, top_k_per_row_decode
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.test_flydsl_fp8_paged_mqa_local_topk import (
+    HEAD_DIM,
+    HEADS,
     _make_packed_case,
     _pack_kv,
     _preshuffle_kv,
     _require_supported_gpu,
     run_torch,
 )
+
+SUPPORTED_GFX = ["gfx950"]
+PAGE_SIZE = 64
+# One packed page token is an fp8 key row plus its fp32 scale.
+TOKEN_BYTES = HEAD_DIM + 4
 
 
 def _run_prototype(case, *, k):
@@ -409,6 +442,53 @@ def test_r4_pass1_live_zero_row_group_early_exit():
     _assert_group_max_matches_oracle(case, packed, actual, group_ends)
 
 
+@pytest.mark.parametrize("rows_per_cta", [2, 4])
+@pytest.mark.parametrize("kv_load_cache_modifier", [0, 4])
+def test_k_stationary_logits_matches_canonical_scores_and_preserves_tail(
+    rows_per_cta,
+    kv_load_cache_modifier,
+):
+    _require_supported_gpu()
+    case = _make_packed_case([4, 4], 128, 64, seed=427, independent_kv=True)
+    case.lengths[:] = torch.tensor(
+        [0, 1, 15, 16, 17, 64, 65, 128],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    logits = torch.full(
+        (case.q.shape[0], 128),
+        -123.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    actual = flydsl_fp8_paged_mqa_logits_k_stationary(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=4,
+        num_splits=8,
+        logits=logits,
+        rows_per_cta=rows_per_cta,
+        kv_load_cache_modifier=kv_load_cache_modifier,
+    )
+    for row in range(case.q.shape[0]):
+        length = int(case.lengths[row])
+        positions = torch.arange(length, dtype=torch.int32, device="cuda")
+        torch.testing.assert_close(
+            actual[row, :length],
+            _rescore_positions(case, row, positions),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        assert torch.all(actual[row, length:] == -123.0)
+
+
 def test_r4_pass1_is_bit_identical_to_r2_and_one_row_scorer():
     _require_supported_gpu()
     case = _make_packed_case([4, 4], 128, 64, seed=431, independent_kv=True)
@@ -599,7 +679,16 @@ def test_dense_harvest_invalid_pages_and_scale_edges():
     )
 
 
-def test_dense_harvest_public_pipeline_short_rows_and_dead_slot():
+def test_plan_group_max_num_splits_fills_by_row_groups():
+    assert plan_group_max_num_splits(8, 4, 65536, rows_per_cta=4, cu_count=256) == 64
+    assert plan_group_max_num_splits(4, 8, 65536, rows_per_cta=4, cu_count=256) == 64
+    assert plan_group_max_num_splits(2, 8, 65536, rows_per_cta=4, cu_count=256) == 128
+    assert plan_group_max_num_splits(2, 4, 65536, rows_per_cta=4, cu_count=256) == 256
+    assert plan_group_max_num_splits(1, 8, 65536, rows_per_cta=4, cu_count=256) == 256
+    assert plan_group_max_num_splits(16, 2, 65536, rows_per_cta=4, cu_count=256) == 64
+
+
+def test_fused_public_pipeline_short_rows_and_dead_slot():
     _require_supported_gpu()
     case = _make_packed_case([4], 32_768, 64, seed=457, independent_kv=True)
     case.lengths[:] = torch.tensor([0, 17, 64, 65], dtype=torch.int32, device="cuda")
@@ -614,6 +703,40 @@ def test_dense_harvest_public_pipeline_short_rows_and_dead_slot():
         case.query_start_loc,
         case.decode_lens,
         max_decode_width=4,
+        fused=True,
+        persistent=False,
+    )
+    torch.cuda.synchronize()
+    reference = run_torch(case)
+    for row, row_scores in enumerate(reference):
+        count = row_scores.numel()
+        got = result.positions[row, :count].long()
+        assert got.unique().numel() == count
+        assert torch.all((got >= 0) & (got < count))
+        torch.testing.assert_close(
+            result.scores[row, :count],
+            row_scores[got],
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        assert torch.all(result.positions[row, count:] == -1)
+        assert torch.all(torch.isneginf(result.scores[row, count:]))
+
+    _require_supported_gpu()
+    case = _make_packed_case([4], 32_768, 64, seed=457, independent_kv=True)
+    case.lengths[:] = torch.tensor([0, 17, 64, 65], dtype=torch.int32, device="cuda")
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    result = flydsl_fp8_paged_mqa_group_max_topk(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=4,
+        fused=False,
     )
     torch.cuda.synchronize()
     reference = run_torch(case)
@@ -678,6 +801,32 @@ def test_position_map_handles_arbitrary_group_order_and_invalid_metadata():
     assert torch.equal(actual, expected)
 
 
+def test_fused_public_pipeline_mass_zero_unstable_set():
+    _require_supported_gpu()
+    case = _make_packed_case([4], 32_768, 64, seed=461, independent_kv=True)
+    case.lengths[:] = 65
+    case.weights.zero_()
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    result = flydsl_fp8_paged_mqa_group_max_topk(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=4,
+        fused=True,
+        persistent=False,
+    )
+    torch.cuda.synchronize()
+    for row in range(case.live_rows):
+        positions = result.positions[row, :65]
+        assert positions.unique().numel() == 65
+        assert torch.all((positions >= 0) & (positions < 65))
+
+
 def test_dense_harvest_public_pipeline_mass_zero_unstable_set():
     _require_supported_gpu()
     case = _make_packed_case([4], 32_768, 64, seed=461, independent_kv=True)
@@ -694,6 +843,7 @@ def test_dense_harvest_public_pipeline_mass_zero_unstable_set():
         case.query_start_loc,
         case.decode_lens,
         max_decode_width=4,
+        fused=False,
     )
     torch.cuda.synchronize()
     for row in range(case.live_rows):
@@ -705,6 +855,215 @@ def test_dense_harvest_public_pipeline_mass_zero_unstable_set():
         )
         assert torch.all(result.positions[row, 65:] == -1)
         assert torch.all(torch.isneginf(result.scores[row, 65:]))
+
+
+def test_dense_harvest_public_pipeline_long_partial_tail_is_exact():
+    """Pin exactness where the harvest window contains nonexistent lanes.
+
+    `context_len = 40007` gives 2501 groups, so more groups than `k`, and a
+    final group holding 7 valid positions and 9 nonexistent ones. Those 9 sit
+    inside `harvest_lengths = count * 16` and score `-inf`.
+
+    Ties would make "exact" undecidable, so the scale epilogue is used as a
+    switch: `total * max(scale, 0)` pins a position to exactly `0` when its
+    scale is zero, and nonnegative weights keep `total` nonnegative. Exactly
+    `k` positions are left strictly positive, including the whole valid tail,
+    so the correct answer is one known set rather than any of many.
+    """
+    _require_supported_gpu()
+    k = 2048
+    context_len = 40_007
+    case = _make_packed_case([2], 65_536, 64, seed=977, independent_kv=True)
+    case.weights.abs_()
+    case.lengths[:] = context_len
+
+    generator = torch.Generator(device="cuda").manual_seed(31337)
+    tail_start = (context_len // GROUP_SIZE) * GROUP_SIZE
+    tail = torch.arange(tail_start, context_len, device="cuda")
+    body = torch.randperm(tail_start, device="cuda", generator=generator)[
+        : k - tail.numel()
+    ]
+    expected = torch.cat([tail, body]).sort().values
+
+    pages = case.block_tables[0][expected // 64].long()
+    tokens = expected % 64
+    scales = torch.zeros_like(case.scales)
+    # A zero scale here would collapse a chosen position back to 0 and close
+    # the gap that makes the answer unique.
+    scales[pages, tokens] = case.scales[pages, tokens].clamp(min=0.25)
+    case.scales.copy_(scales)
+
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    reference = run_torch(case)
+    for row_scores in reference:
+        assert torch.equal((row_scores > 0).nonzero().flatten(), expected)
+
+    result = flydsl_fp8_paged_mqa_group_max_topk(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=2,
+        fused=False,
+    )
+    torch.cuda.synchronize()
+
+    for row, row_scores in enumerate(reference):
+        got = result.positions[row].long()
+        assert torch.equal(got.sort().values, expected)
+        assert got[(got >= tail_start) & (got < context_len)].numel() == tail.numel()
+        torch.testing.assert_close(
+            result.scores[row].sort().values,
+            row_scores[got.sort().values].sort().values,
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+
+def test_fused_public_pipeline_long_partial_tail_is_exact():
+    _require_supported_gpu()
+    k = 2048
+    context_len = 40_007
+    case = _make_packed_case([2], 65_536, 64, seed=977, independent_kv=True)
+    case.weights.abs_()
+    case.lengths[:] = context_len
+
+    generator = torch.Generator(device="cuda").manual_seed(31337)
+    tail_start = (context_len // GROUP_SIZE) * GROUP_SIZE
+    tail = torch.arange(tail_start, context_len, device="cuda")
+    body = torch.randperm(tail_start, device="cuda", generator=generator)[
+        : k - tail.numel()
+    ]
+    expected = torch.cat([tail, body]).sort().values
+
+    pages = case.block_tables[0][expected // 64].long()
+    tokens = expected % 64
+    scales = torch.zeros_like(case.scales)
+    scales[pages, tokens] = case.scales[pages, tokens].clamp(min=0.25)
+    case.scales.copy_(scales)
+
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    result = flydsl_fp8_paged_mqa_group_max_topk(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=2,
+        fused=True,
+        persistent=False,
+    )
+    torch.cuda.synchronize()
+    for row in range(case.live_rows):
+        got = result.positions[row].long()
+        assert torch.equal(got.sort().values, expected)
+        assert got[(got >= tail_start) & (got < context_len)].numel() == tail.numel()
+
+
+@pytest.mark.xfail(
+    reason="persistent fused K2 still drops short-row positions; compact fused is default",
+    strict=False,
+)
+def test_fused_persistent_public_pipeline_short_rows_and_dead_slot():
+    _require_supported_gpu()
+    case = _make_packed_case([4], 32_768, 64, seed=457, independent_kv=True)
+    case.lengths[:] = torch.tensor([0, 17, 64, 65], dtype=torch.int32, device="cuda")
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    rows = int(case.q.shape[0])
+    workspace = torch.zeros(
+        fused_k2_workspace_elems(rows), dtype=torch.int32, device="cuda"
+    )
+    result = flydsl_fp8_paged_mqa_group_max_topk(
+        case.q,
+        packed,
+        case.weights,
+        case.lengths,
+        case.block_tables,
+        case.indices,
+        case.query_start_loc,
+        case.decode_lens,
+        max_decode_width=4,
+        fused=True,
+        persistent=True,
+        fused_workspace=workspace,
+    )
+    torch.cuda.synchronize()
+    reference = run_torch(case)
+    for row, row_scores in enumerate(reference):
+        count = row_scores.numel()
+        got = result.positions[row, :count].long()
+        assert got.unique().numel() == count
+        assert torch.all((got >= 0) & (got < count))
+        torch.testing.assert_close(
+            result.scores[row, :count],
+            row_scores[got],
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        assert torch.all(result.positions[row, count:] == -1)
+        assert torch.all(torch.isneginf(result.scores[row, count:]))
+
+
+def test_fused_workspace_restore_allows_repeated_and_concurrent_replay():
+    _require_supported_gpu()
+    case = _make_packed_case([4], 32_768, 64, seed=611, independent_kv=True)
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    rows = int(case.q.shape[0])
+    workspace = torch.zeros(
+        fused_k2_workspace_elems(rows), dtype=torch.int32, device="cuda"
+    )
+
+    def _launch(*, persistent, fused_workspace=workspace):
+        return flydsl_fp8_paged_mqa_group_max_topk(
+            case.q,
+            packed,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            case.indices,
+            case.query_start_loc,
+            case.decode_lens,
+            max_decode_width=4,
+            fused=True,
+            persistent=persistent,
+            fused_workspace=fused_workspace,
+        )
+
+    first = _launch(persistent=False)
+    second = _launch(persistent=False)
+    torch.cuda.synchronize()
+    reference = run_torch(case)
+    for result in (first, second):
+        for row, row_scores in enumerate(reference):
+            count = min(2048, row_scores.numel())
+            got = result.positions[row, :count].long()
+            assert got.unique().numel() == count
+            torch.testing.assert_close(
+                result.scores[row, :count],
+                row_scores[got],
+                rtol=2e-4,
+                atol=2e-4,
+            )
+    other = torch.zeros_like(workspace)
+    s0 = torch.cuda.Stream()
+    s1 = torch.cuda.Stream()
+    with torch.cuda.stream(s0):
+        c0 = _launch(persistent=False, fused_workspace=workspace)
+    with torch.cuda.stream(s1):
+        c1 = _launch(persistent=False, fused_workspace=other)
+    torch.cuda.synchronize()
+    for result in (c0, c1):
+        for row, row_scores in enumerate(reference):
+            count = min(2048, row_scores.numel())
+            got = result.positions[row, :count].long()
+            assert got.unique().numel() == count
 
 
 @pytest.mark.parametrize("length", [0, 1, 15, 16, 17, 64, 65])
@@ -755,3 +1114,487 @@ def test_packed_abi_rejects_missing_indices_and_rectangles():
             case.decode_lens,
             k=4,
         )
+
+
+def _rescore_positions(case, row, positions):
+    """Independent fp32 scores for just the positions the pipeline returned.
+
+    A full-length oracle needs a `[HEADS, L, HEAD_DIM]` intermediate, which is
+    not affordable at the 1M gate inside a sweep. Exact set membership is
+    covered by the pytest cases above, so the benchmark checks the other half
+    of the contract: that each returned score is the canonical fp32 score of
+    the position it is paired with.
+    """
+    q = case.q.reshape(-1, HEADS, HEAD_DIM)[row].float()
+    flat_kv = case.kv.reshape(-1, HEAD_DIM)
+    flat_scales = case.scales.reshape(-1)
+    logical = positions.long()
+    live = logical >= 0
+    safe = torch.where(live, logical, torch.zeros_like(logical))
+    pages = case.block_tables[int(case.indices[row]), safe // PAGE_SIZE]
+    page_ok = live & (pages >= 0) & (pages < case.kv.shape[0])
+    physical = torch.where(page_ok, pages, 0) * PAGE_SIZE + safe % PAGE_SIZE
+    keys = flat_kv[physical].float()
+    activated = torch.relu(torch.sum(q[:, None, :] * keys[None, :, :], dim=-1))
+    weighted = torch.sum(case.weights[row, :, None] * activated, dim=0)
+    scale = torch.fmax(
+        flat_scales[physical],
+        torch.zeros((), dtype=torch.float32, device=q.device),
+    )
+    scores = weighted * scale
+    return torch.where(
+        page_ok & ~torch.isnan(scores),
+        scores,
+        torch.full_like(scores, float("-inf")),
+    )
+
+
+def _benchmark_case(rows, next_n, length, k):
+    """Build the case plus the caller-owned buffers a serving graph would hold."""
+    requests = rows // next_n
+    case = _make_packed_case(
+        [next_n] * requests,
+        length,
+        PAGE_SIZE,
+        seed=503 + next_n + requests,
+        independent_kv=True,
+    )
+    packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
+    group_width = length // GROUP_SIZE
+    buffers = {
+        "group_max": torch.empty(
+            (rows, group_width), dtype=torch.float32, device="cuda"
+        ),
+        "group_ends": torch.empty((rows,), dtype=torch.int32, device="cuda"),
+        "selected_group_ids": torch.empty(
+            (rows, k), dtype=torch.int32, device="cuda"
+        ),
+        "harvest_scores": torch.empty(
+            (rows, k * GROUP_SIZE), dtype=torch.float32, device="cuda"
+        ),
+        "harvest_lengths": torch.empty((rows,), dtype=torch.int32, device="cuda"),
+        "final_ordinals": torch.empty((rows, k), dtype=torch.int32, device="cuda"),
+        "final_scores": torch.empty((rows, k), dtype=torch.float32, device="cuda"),
+        "final_positions": torch.empty((rows, k), dtype=torch.int32, device="cuda"),
+    }
+    return case, packed, buffers
+
+
+def _pipeline_stages(case, packed, buffers, *, rows, next_n, k):
+    """The five launches, each callable on its own for a stage breakdown.
+
+    Every stage is idempotent given its predecessor has run once, so replaying
+    one stage in isolation measures it without disturbing the others.
+    """
+    stream = torch.cuda.current_stream()
+    group_max = buffers["group_max"]
+    group_ends = buffers["group_ends"]
+    selected_group_ids = buffers["selected_group_ids"]
+    harvest_scores = buffers["harvest_scores"]
+    harvest_lengths = buffers["harvest_lengths"]
+    final_ordinals = buffers["final_ordinals"]
+    final_scores = buffers["final_scores"]
+    final_positions = buffers["final_positions"]
+
+    def k1_group_max():
+        launch_fp8_paged_mqa_group_max(
+            case.q,
+            packed,
+            case.weights,
+            case.lengths,
+            case.query_start_loc,
+            case.decode_lens,
+            case.block_tables,
+            group_max,
+            group_ends,
+            max_decode_width=next_n,
+            num_splits=64,
+            arch=get_gfx(),
+            stream=stream,
+            rows_per_cta=4,
+            q_in_lds=False,
+        )
+        return group_max
+
+    def k2_group_topk():
+        top_k_per_row_decode(
+            logits=group_max,
+            next_n=1,
+            seqLens=group_ends,
+            indices=selected_group_ids,
+            numRows=rows,
+            stride0=group_max.stride(0),
+            stride1=1,
+            k=k,
+            stable=False,
+            values=None,
+        )
+        return selected_group_ids
+
+    def k3_harvest():
+        launch_fp8_paged_mqa_group_harvest(
+            case.q,
+            packed,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            case.indices,
+            selected_group_ids,
+            group_ends,
+            harvest_scores,
+            selected_group_ids,
+            harvest_lengths,
+            arch=get_gfx(),
+            stream=stream,
+            emit_positions=False,
+        )
+        return harvest_scores
+
+    def final_topk():
+        top_k_per_row_decode(
+            logits=harvest_scores,
+            next_n=1,
+            seqLens=harvest_lengths,
+            indices=final_ordinals,
+            numRows=rows,
+            stride0=harvest_scores.stride(0),
+            stride1=1,
+            k=k,
+            stable=False,
+            values=final_scores,
+        )
+        return final_scores
+
+    def position_map():
+        launch_fp8_paged_mqa_position_map(
+            final_ordinals,
+            selected_group_ids,
+            group_ends,
+            case.lengths,
+            final_positions,
+            arch=get_gfx(),
+            stream=stream,
+        )
+        return final_positions
+
+    return {
+        "k1_group_max": k1_group_max,
+        "k2_group_topk": k2_group_topk,
+        "k3_harvest": k3_harvest,
+        "final_topk": final_topk,
+        "position_map": position_map,
+    }
+
+
+@benchmark()
+def benchmark_group_max_topk(rows, next_n, length, k):
+    case, packed, buffers = _benchmark_case(rows, next_n, length, k)
+    stages = _pipeline_stages(
+        case, packed, buffers, rows=rows, next_n=next_n, k=k
+    )
+
+    def preallocated():
+        for stage in stages.values():
+            stage()
+        return buffers["final_scores"], buffers["final_positions"]
+
+    def public_wrapper():
+        result = flydsl_fp8_paged_mqa_group_max_topk(
+            case.q,
+            packed,
+            case.weights,
+            case.lengths,
+            case.block_tables,
+            case.indices,
+            case.query_start_loc,
+            case.decode_lens,
+            max_decode_width=next_n,
+            k=k,
+        )
+        return result.scores, result.positions
+
+    candidates = {
+        "preallocated": preallocated,
+        "public_wrapper": public_wrapper,
+    }
+
+    # K1 scores every position; K3 re-scores the selected groups densely. Both
+    # do the arithmetic per row, so FLOPs count rows.
+    flops = 2 * rows * (length + k * GROUP_SIZE) * HEADS * HEAD_DIM
+    # Bytes count what has to leave HBM, which is not the same as per-row
+    # traffic: the sibling rows of one request walk the same KV pages in K1,
+    # and R=4 exists to exploit that. K3 gathers per row, because siblings
+    # select different groups.
+    nbytes = (
+        case.q.numel() * case.q.element_size()
+        + case.weights.numel() * case.weights.element_size()
+        + (rows // next_n) * length * TOKEN_BYTES
+        + rows * k * GROUP_SIZE * TOKEN_BYTES
+        + rows * (length // GROUP_SIZE) * 4 * 2
+        + rows * k * GROUP_SIZE * 4 * 2
+        + rows * k * 8
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (scores, positions), us = run_perftest(fn)
+        err = checkAllclose(
+            _rescore_positions(case, 0, positions[0]),
+            scores[0].float(),
+            rtol=2e-4,
+            atol=2e-4,
+            msg=f"{name}: group-max topk",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def benchmark_group_max_topk_stages(rows, next_n, length, k):
+    """Per-stage attribution, replayed in isolation.
+
+    Each stage is timed by replaying only itself, so its inputs stay resident
+    across iterations. That makes these numbers cache-warm lower bounds rather
+    than the stage's cost inside the pipeline, where the previous stage has
+    just evicted what this one wants. Use `benchmark_group_max_topk` for the
+    cost of the pipeline and this table only to attribute within it.
+    """
+    case, packed, buffers = _benchmark_case(rows, next_n, length, k)
+    stages = _pipeline_stages(
+        case, packed, buffers, rows=rows, next_n=next_n, k=k
+    )
+    for stage in stages.values():
+        stage()
+    torch.cuda.synchronize()
+
+    group_width = length // GROUP_SIZE
+    harvest_width = k * GROUP_SIZE
+    # Per-stage roofline. The two selectors and the map do no arithmetic, so
+    # their TFLOPS column is zero by construction and only TB/s is meaningful.
+    # K1's KV bytes are per request because sibling rows share those pages.
+    roofline = {
+        "k1_group_max": (
+            2 * rows * length * HEADS * HEAD_DIM,
+            (rows // next_n) * length * TOKEN_BYTES + rows * group_width * 4,
+        ),
+        "k2_group_topk": (0, rows * group_width * 4 + rows * k * 4),
+        "k3_harvest": (
+            2 * rows * harvest_width * HEADS * HEAD_DIM,
+            rows * harvest_width * TOKEN_BYTES + rows * harvest_width * 4,
+        ),
+        "final_topk": (0, rows * harvest_width * 4 + rows * k * 8),
+        "position_map": (0, rows * k * 4 * 2),
+    }
+
+    # One correctness check for the pipeline the stages compose, rather than a
+    # per-stage column: the stages are sequential pieces of one result, not
+    # interchangeable candidates.
+    ret = {
+        "gfx": get_gfx(),
+        "pipeline err": checkAllclose(
+            _rescore_positions(case, 0, buffers["final_positions"][0]),
+            buffers["final_scores"][0].float(),
+            rtol=2e-4,
+            atol=2e-4,
+            msg="group-max topk stages",
+        ),
+    }
+    for name, fn in stages.items():
+        _, us = run_perftest(fn)
+        flops, nbytes = roofline[name]
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+    return ret
+
+
+def _assert_selector_matches(
+    logits, row_ends, actual_indices, reference_indices, actual_values=None
+):
+    """Check unstable TopK membership and optional score correspondence."""
+    for row in range(logits.shape[0]):
+        count = min(int(row_ends[row]), actual_indices.shape[1])
+        actual = actual_indices[row, :count].long()
+        reference = reference_indices[row, :count].long()
+        assert actual.unique().numel() == count
+        torch.testing.assert_close(
+            logits[row, actual].sort().values,
+            logits[row, reference].sort().values,
+            rtol=0,
+            atol=0,
+        )
+        if actual_values is not None:
+            torch.testing.assert_close(
+                actual_values[row, :count],
+                logits[row, actual],
+                rtol=0,
+                atol=0,
+            )
+
+
+@benchmark()
+def benchmark_group_max_topk_selectors(rows, next_n, length, k):
+    """Matched selector comparison at the exact K2 and final-stage shapes."""
+    case, packed, buffers = _benchmark_case(rows, next_n, length, k)
+    stages = _pipeline_stages(
+        case, packed, buffers, rows=rows, next_n=next_n, k=k
+    )
+    stages["k1_group_max"]()
+    stages["k2_group_topk"]()
+    stages["k3_harvest"]()
+    torch.cuda.synchronize()
+
+    stream = torch.cuda.current_stream()
+    wave_size = 64
+    ret = {"gfx": get_gfx()}
+    selector_specs = {
+        "k2": (
+            buffers["group_max"],
+            buffers["group_ends"],
+            False,
+        ),
+        "final": (
+            buffers["harvest_scores"],
+            buffers["harvest_lengths"],
+            True,
+        ),
+    }
+
+    for stage_name, (logits, row_ends, write_values) in selector_specs.items():
+        outputs = {}
+
+        def make_outputs():
+            indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+            values = (
+                torch.empty((rows, k), dtype=torch.float32, device="cuda")
+                if write_values
+                else None
+            )
+            return indices, values
+
+        hip_indices, hip_values = make_outputs()
+
+        def hip_one_block():
+            _hip_top_k_per_row_decode(
+                logits,
+                1,
+                row_ends,
+                hip_indices,
+                rows,
+                logits.stride(0),
+                1,
+                k,
+                False,
+                hip_values,
+            )
+            return hip_indices
+
+        outputs["hip_one_block"] = (hip_one_block, hip_indices, hip_values)
+
+        multi_indices, multi_values = make_outputs()
+
+        def flydsl_multi():
+            flydsl_top_k_per_row_decode(
+                logits,
+                1,
+                row_ends,
+                multi_indices,
+                rows,
+                logits.stride(0),
+                1,
+                k,
+                False,
+                multi_values,
+            )
+            return multi_indices
+
+        outputs["flydsl_multi"] = (flydsl_multi, multi_indices, multi_values)
+
+        one_wg_indices, one_wg_values = make_outputs()
+        one_wg_launcher = build_topk_per_row_decode_one_workgroup_module(
+            k,
+            wave_size=wave_size,
+            write_values=write_values,
+        )
+
+        def flydsl_one_wg():
+            _run_compiled(
+                one_wg_launcher,
+                logits,
+                row_ends,
+                one_wg_indices,
+                one_wg_values if one_wg_values is not None else logits,
+                logits.shape[1],
+                1,
+                logits.stride(0),
+                rows,
+                stream,
+            )
+            return one_wg_indices
+
+        outputs["flydsl_one_wg"] = (
+            flydsl_one_wg,
+            one_wg_indices,
+            one_wg_values,
+        )
+
+        hip_one_block()
+        torch.cuda.synchronize()
+        for implementation, (fn, indices, values) in outputs.items():
+            _, us = run_perftest(fn)
+            _assert_selector_matches(
+                logits, row_ends, indices, hip_indices, values
+            )
+            ret[f"{stage_name} {implementation} us"] = us
+
+    return ret
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fp8_paged_mqa_group_max_topk unsupported on %s; skipping", get_gfx()
+        )
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Packed-varlen group-max pruning and dense-harvest sweep",
+    )
+    parser.add_argument("-r", "--rows", type=int, nargs="*", default=[32])
+    parser.add_argument("-n", "--next-n", type=int, nargs="*", default=[4, 8])
+    parser.add_argument("-l", "--length", type=int, nargs="*", default=[1_048_576])
+    parser.add_argument("-k", "--topk", type=int, nargs="*", default=[2048])
+    args = parser.parse_args()
+
+    axes = list(itertools.product(args.rows, args.next_n, args.length, args.topk))
+
+    summary = pd.DataFrame(
+        [benchmark_group_max_topk(*axis) for axis in axes]
+    )
+    aiter.logger.info(
+        "fp8_paged_mqa_group_max_topk summary (markdown):\n%s",
+        summary.to_markdown(index=False),
+    )
+
+    stage_summary = pd.DataFrame(
+        [benchmark_group_max_topk_stages(*axis) for axis in axes]
+    )
+    aiter.logger.info(
+        "fp8_paged_mqa_group_max_topk stage summary (markdown):\n%s",
+        stage_summary.to_markdown(index=False),
+    )
+
+    selector_summary = pd.DataFrame(
+        [benchmark_group_max_topk_selectors(*axis) for axis in axes]
+    )
+    aiter.logger.info(
+        "fp8_paged_mqa_group_max_topk selector summary (markdown):\n%s",
+        selector_summary.to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()

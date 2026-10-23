@@ -1,7 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Packed-varlen group-max pruning prototype for paged FP8 MQA."""
+"""Packed-varlen group-max pruning prototype for paged FP8 MQA.
+
+Selection contract
+------------------
+For finite, well-formed inputs the pipeline returns an exact unstable top-k:
+the correct set of logical positions, each paired with its own score, in
+unspecified order. Scores are finite in this regime, because `relu` is
+nonnegative and the epilogue clamps the scale with `max(scale, 0)`.
+
+Two regimes are outside that guarantee.
+
+NaN or infinite inputs are unspecified; `canonical_score_tile` canonicalizes
+NaN to `-inf` but no claim is made about the resulting selection.
+
+Invalid physical pages inside `context_lens` are unspecified once a row has
+more groups than `k`. Such positions score `-inf`, and so do the nonexistent
+lanes of a selected partial tail group, which stay inside the selection
+window because `harvest_lengths` is `count * group_size`. When a row has
+fewer than `k` candidates that score above `-inf`, those two kinds of `-inf`
+are indistinguishable to the selector, and a nonexistent lane can take a slot
+that an invalid-page position would otherwise hold; it is reported as
+position `-1`. Rows with at most `k` groups keep the older behaviour of
+returning every invalid-page position as a real `-inf` candidate.
+"""
 
 from dataclasses import dataclass
 
@@ -14,20 +37,94 @@ from .fp8_paged_mqa_local_topk import (
     _arch_name,
     _require_cuda_contiguous,
 )
+from .topk_per_row import flydsl_top_k_per_row_decode
 from .kernels.mqa_logits.fp8_paged_mqa_group_harvest import (
     HARVEST_SPLITS,
     launch_fp8_paged_mqa_group_harvest,
     launch_fp8_paged_mqa_position_map,
 )
+from .kernels.mqa_logits.fp8_paged_mqa_fused_k2 import (
+    fused_k2_parts,
+    fused_k2_workspace_elems,
+    launch_fp8_paged_mqa_compact_harvest,
+    launch_fp8_paged_mqa_fused_k2,
+    launch_fp8_paged_mqa_gather_positions,
+)
 from .kernels.mqa_logits.fp8_paged_mqa_group_max import (
     ROWS_PER_CTA,
     launch_fp8_paged_mqa_group_max,
+    launch_fp8_paged_mqa_logits,
 )
 
 HEADS = 32
 PAGE_SIZE = 64
 GROUP_SIZE = 16
 SUPPORTED_ARCHES = ("gfx950",)
+K1_WORKGROUPS_PER_CU = 2
+MAX_GROUP_MAX_SPLITS = 512
+
+
+def plan_group_max_num_splits(
+    request_capacity: int,
+    max_decode_width: int,
+    max_groups: int,
+    *,
+    rows_per_cta: int = 4,
+    cu_count: int = 256,
+) -> int:
+    """Choose K1 splits from graph-stable request row-groups, not a fixed 64.
+
+    K1 launches ``splits * request_capacity * ceil(max_decode_width / R)``
+    CTAs at two workgroups/CU.     The table is the robust GPU-0 AB/BA fill study: 256 splits at 1–2
+    row-groups, 128 at 4, and 64 at 8, where extra splits were slower.
+    """
+    if request_capacity <= 0 or max_decode_width < 2 or max_groups <= 0:
+        raise ValueError(
+            "request_capacity, max_decode_width, and max_groups must be valid"
+        )
+    if rows_per_cta not in (2, 3, 4):
+        raise ValueError(f"rows_per_cta must be 2, 3, or 4, got {rows_per_cta}")
+    if cu_count <= 0:
+        raise ValueError("cu_count must be positive")
+    row_groups = max(1, (int(max_decode_width) + rows_per_cta - 1) // rows_per_cta)
+    work_units = max(1, int(request_capacity) * row_groups)
+    occupancy_wave = K1_WORKGROUPS_PER_CU * int(cu_count)
+    if work_units <= 2:
+        splits = 256
+    elif work_units <= 4:
+        splits = 128
+    elif work_units <= 8:
+        splits = 64
+    else:
+        target = 2 * occupancy_wave
+        splits = max(1, (target + work_units - 1) // work_units)
+        splits = 1 << (splits - 1).bit_length()
+    return min(max(splits, 1), int(max_groups), MAX_GROUP_MAX_SPLITS)
+
+
+def _resolve_group_max_num_splits(
+    num_splits,
+    decode_lens,
+    max_decode_width,
+    rows_per_cta,
+    block_tables,
+    device,
+    group_size,
+):
+    if num_splits is not None:
+        if not isinstance(num_splits, int) or num_splits <= 0:
+            raise ValueError("num_splits must be a positive integer")
+        return num_splits
+    cu_count = torch.cuda.get_device_properties(device).multi_processor_count
+    max_length = int(block_tables.shape[1]) * PAGE_SIZE
+    max_groups = (max_length + group_size - 1) // group_size
+    return plan_group_max_num_splits(
+        int(decode_lens.numel()),
+        int(max_decode_width),
+        max_groups,
+        rows_per_cta=rows_per_cta,
+        cu_count=cu_count,
+    )
 
 
 @dataclass
@@ -358,9 +455,9 @@ def flydsl_fp8_paged_mqa_group_max(
     decode_lens,
     *,
     max_decode_width,
-    num_splits=64,
+    num_splits=None,
     group_size=GROUP_SIZE,
-    rows_per_cta=ROWS_PER_CTA,
+    rows_per_cta=4,
     q_in_lds=None,
 ):
     """Run an experimental packed pass and return maxima plus ragged row ends."""
@@ -377,10 +474,17 @@ def flydsl_fp8_paged_mqa_group_max(
     )
     if not isinstance(max_decode_width, int) or max_decode_width < 2:
         raise ValueError("max_decode_width must be a captured integer >= 2")
-    if rows_per_cta not in (2, 4):
-        raise ValueError(f"rows_per_cta must be 2 or 4, got {rows_per_cta}")
-    if not isinstance(num_splits, int) or num_splits <= 0:
-        raise ValueError("num_splits must be a positive integer")
+    if rows_per_cta not in (2, 3, 4):
+        raise ValueError(f"rows_per_cta must be 2, 3, or 4, got {rows_per_cta}")
+    num_splits = _resolve_group_max_num_splits(
+        num_splits,
+        decode_lens,
+        max_decode_width,
+        rows_per_cta,
+        block_tables,
+        q_fp8.device,
+        group_size,
+    )
     max_length = int(block_tables.shape[1]) * PAGE_SIZE
     group_width = (max_length + group_size - 1) // group_size
     group_max = torch.empty(
@@ -388,12 +492,7 @@ def flydsl_fp8_paged_mqa_group_max(
         dtype=torch.float32,
         device=q_fp8.device,
     )
-    group_ends = (
-        context_lens.clamp(min=0, max=max_length)
-        .add(group_size - 1)
-        .div(group_size, rounding_mode="floor")
-        .to(torch.int32)
-    )
+    group_ends = torch.empty(rows, dtype=torch.int32, device=q_fp8.device)
     stream = torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device):
         launch_fp8_paged_mqa_group_max(
@@ -405,6 +504,7 @@ def flydsl_fp8_paged_mqa_group_max(
             decode_lens,
             block_tables,
             group_max,
+            group_ends,
             max_decode_width=max_decode_width,
             num_splits=num_splits,
             arch=_arch_name(q_fp8.device),
@@ -413,6 +513,82 @@ def flydsl_fp8_paged_mqa_group_max(
             q_in_lds=q_in_lds,
         )
     return group_max, group_ends
+
+
+def flydsl_fp8_paged_mqa_logits_k_stationary(
+    q_fp8,
+    packed_preshuffled_kv,
+    weights,
+    context_lens,
+    block_tables,
+    indices,
+    query_start_loc,
+    decode_lens,
+    *,
+    max_decode_width,
+    num_splits=None,
+    logits=None,
+    rows_per_cta=4,
+    store_cache_modifier=0,
+    kv_load_cache_modifier=0,
+):
+    """Experimental R=2/R=4 K-stationary scorer with dense FP32 output."""
+    rows = _validate_prototype_inputs(
+        q_fp8,
+        packed_preshuffled_kv,
+        weights,
+        context_lens,
+        block_tables,
+        indices,
+        query_start_loc,
+        decode_lens,
+        group_size=GROUP_SIZE,
+    )
+    if not isinstance(max_decode_width, int) or max_decode_width < 2:
+        raise ValueError("max_decode_width must be a captured integer >= 2")
+    if rows_per_cta not in (2, 3, 4):
+        raise ValueError(f"rows_per_cta must be 2, 3, or 4, got {rows_per_cta}")
+    num_splits = _resolve_group_max_num_splits(
+        num_splits,
+        decode_lens,
+        max_decode_width,
+        rows_per_cta,
+        block_tables,
+        q_fp8.device,
+        GROUP_SIZE,
+    )
+    max_length = int(block_tables.shape[1]) * PAGE_SIZE
+    if logits is None:
+        logits = torch.empty(
+            (rows, max_length),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    elif logits.shape != (rows, max_length) or logits.dtype != torch.float32:
+        raise ValueError(
+            f"logits must be float32 with shape {(rows, max_length)}, "
+            f"got {tuple(logits.shape)} {logits.dtype}"
+        )
+    stream = torch.cuda.current_stream(q_fp8.device)
+    with torch.cuda.device(q_fp8.device):
+        launch_fp8_paged_mqa_logits(
+            q_fp8,
+            packed_preshuffled_kv,
+            weights,
+            context_lens,
+            query_start_loc,
+            decode_lens,
+            block_tables,
+            logits,
+            max_decode_width=max_decode_width,
+            num_splits=num_splits,
+            arch=_arch_name(q_fp8.device),
+            stream=stream,
+            rows_per_cta=rows_per_cta,
+            store_cache_modifier=store_cache_modifier,
+            kv_load_cache_modifier=kv_load_cache_modifier,
+        )
+    return logits
 
 
 def flydsl_fp8_paged_mqa_group_harvest(
@@ -581,7 +757,7 @@ def flydsl_fp8_paged_mqa_group_max_topk(
     max_decode_width,
     k=2048,
     group_size=GROUP_SIZE,
-    num_splits=64,
+    num_splits=None,
     harvest_splits=HARVEST_SPLITS,
     rows_per_cta=4,
     group_max=None,
@@ -589,8 +765,17 @@ def flydsl_fp8_paged_mqa_group_max_topk(
     selected_group_scores=None,
     selected_group_ids=None,
     selected_group_counts=None,
+    fused=False,
+    fused_workspace=None,
+    persistent=False,
 ) -> GroupMaxTopKResult:
-    """Run the safe dense-harvest bring-up without serving dispatch changes."""
+    """Run group-max scoring plus harvest and selection.
+
+    ``fused=True`` keeps a compact τ-filtered bag instead of the dense
+    32k harvest. It is exact on the public contract but is not the
+    default: matched e2e still prefers dense harvest. ``persistent=True``
+    is an occupancy-bounded one-kernel prototype and is not exact yet.
+    """
     if k != 2048:
         raise ValueError("the initial dense-harvest pipeline requires k=2048")
     rows = int(q_fp8.shape[0])
@@ -612,31 +797,11 @@ def flydsl_fp8_paged_mqa_group_max_topk(
             rows_per_cta=rows_per_cta,
         )
 
-    if selected_group_ids is None or selected_group_counts is None:
-        if selected_group_ids is not None or selected_group_counts is not None:
+    if selected_group_ids is not None or selected_group_counts is not None:
+        if selected_group_ids is None or selected_group_counts is None:
             raise ValueError(
                 "selected_group_ids and selected_group_counts must be supplied together"
             )
-        selected_group_ids = torch.empty(
-            (rows, k), dtype=torch.int32, device=q_fp8.device
-        )
-        selected_group_counts = torch.minimum(
-            group_ends,
-            torch.full_like(group_ends, k),
-        )
-        top_k_per_row_decode(
-            logits=group_max,
-            next_n=1,
-            seqLens=group_ends,
-            indices=selected_group_ids,
-            numRows=rows,
-            stride0=group_max.stride(0),
-            stride1=1,
-            k=k,
-            stable=False,
-            values=selected_group_scores,
-        )
-    else:
         if selected_group_ids.shape != (rows, k):
             raise ValueError(f"selected_group_ids must have shape {(rows, k)}")
         if selected_group_counts.shape != (rows,):
@@ -647,6 +812,61 @@ def flydsl_fp8_paged_mqa_group_max_topk(
         ):
             raise ValueError(
                 f"selected_group_scores must be float32 with shape {(rows, k)}"
+            )
+        fused = False
+
+    if fused:
+        return _run_fused_group_max_topk(
+            q_fp8,
+            packed_preshuffled_kv,
+            weights,
+            context_lens,
+            block_tables,
+            indices,
+            query_start_loc,
+            decode_lens,
+            group_max,
+            group_ends,
+            k=k,
+            fused_workspace=fused_workspace,
+            persistent=persistent,
+        )
+
+    if selected_group_ids is None:
+        selected_group_ids = torch.empty(
+            (rows, k), dtype=torch.int32, device=q_fp8.device
+        )
+        selected_group_counts = group_ends
+        if (
+            rows == 32
+            and group_max.shape[1] == 65_536
+            and selected_group_scores is None
+            and _arch_name(group_max.device) == "gfx950"
+        ):
+            flydsl_top_k_per_row_decode(
+                group_max,
+                1,
+                group_ends,
+                selected_group_ids,
+                rows,
+                group_max.stride(0),
+                1,
+                k,
+                False,
+                None,
+            )
+        else:
+            top_k_per_row_decode(
+                logits=group_max,
+                next_n=1,
+                seqLens=group_ends,
+                indices=selected_group_ids,
+                numRows=rows,
+                stride0=group_max.stride(0),
+                stride1=1,
+                k=k,
+                stable=False,
+                values=selected_group_scores,
             )
     harvest_scores, harvest_positions, harvest_lengths = (
         flydsl_fp8_paged_mqa_group_harvest(
@@ -697,6 +917,169 @@ def flydsl_fp8_paged_mqa_group_max_topk(
         harvest_positions=harvest_positions,
         harvest_lengths=harvest_lengths,
         harvest_ordinals=harvest_ordinals,
+    )
+
+
+def _run_fused_group_max_topk(
+    q_fp8,
+    packed_preshuffled_kv,
+    weights,
+    context_lens,
+    block_tables,
+    indices,
+    query_start_loc,
+    decode_lens,
+    group_max,
+    group_ends,
+    *,
+    k,
+    fused_workspace,
+    persistent,
+) -> GroupMaxTopKResult:
+    rows = int(q_fp8.shape[0])
+    device = q_fp8.device
+    arch = _arch_name(device)
+    stream = torch.cuda.current_stream(device)
+    cu_count = torch.cuda.get_device_properties(device).multi_processor_count
+    parts = fused_k2_parts(rows, cu_count)
+    scores = torch.empty((rows, k), dtype=torch.float32, device=device)
+    positions = torch.empty((rows, k), dtype=torch.int32, device=device)
+    candidate_cap = k * GROUP_SIZE
+    candidate_scores = torch.empty(
+        (rows, candidate_cap), dtype=torch.float32, device=device
+    )
+    candidate_positions = torch.empty(
+        (rows, candidate_cap), dtype=torch.int32, device=device
+    )
+    used_persistent = False
+    if persistent and parts >= 2 and arch == "gfx950":
+        if fused_workspace is None:
+            fused_workspace = torch.zeros(
+                fused_k2_workspace_elems(rows),
+                dtype=torch.int32,
+                device=device,
+            )
+        elif fused_workspace.numel() != fused_k2_workspace_elems(rows):
+            raise ValueError(
+                "fused_workspace must have "
+                f"{fused_k2_workspace_elems(rows)} int32 elements"
+            )
+        with torch.cuda.device(device):
+            launch_fp8_paged_mqa_fused_k2(
+                q_fp8,
+                packed_preshuffled_kv,
+                weights,
+                context_lens,
+                block_tables,
+                indices,
+                group_max,
+                group_ends,
+                fused_workspace,
+                scores,
+                positions,
+                candidate_scores,
+                candidate_positions,
+                k=k,
+                parts=parts,
+                arch=arch,
+                stream=stream,
+            )
+        used_persistent = True
+    if not used_persistent:
+        selected_group_ids = torch.empty((rows, k), dtype=torch.int32, device=device)
+        if rows == 32 and group_max.shape[1] == 65_536 and arch == "gfx950":
+            flydsl_top_k_per_row_decode(
+                group_max,
+                1,
+                group_ends,
+                selected_group_ids,
+                rows,
+                group_max.stride(0),
+                1,
+                k,
+                False,
+                None,
+            )
+        else:
+            top_k_per_row_decode(
+                logits=group_max,
+                next_n=1,
+                seqLens=group_ends,
+                indices=selected_group_ids,
+                numRows=rows,
+                stride0=group_max.stride(0),
+                stride1=1,
+                k=k,
+                stable=False,
+            )
+        harvest_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+        with torch.cuda.device(device):
+            launch_fp8_paged_mqa_compact_harvest(
+                q_fp8,
+                packed_preshuffled_kv,
+                weights,
+                context_lens,
+                block_tables,
+                indices,
+                selected_group_ids,
+                group_ends,
+                group_max,
+                candidate_scores,
+                candidate_positions,
+                harvest_lengths,
+                arch=arch,
+                stream=stream,
+            )
+        harvest_ordinals = torch.empty((rows, k), dtype=torch.int32, device=device)
+        top_k_per_row_decode(
+            logits=candidate_scores,
+            next_n=1,
+            seqLens=harvest_lengths,
+            indices=harvest_ordinals,
+            numRows=rows,
+            stride0=candidate_scores.stride(0),
+            stride1=1,
+            k=k,
+            stable=False,
+            values=scores,
+        )
+        with torch.cuda.device(device):
+            launch_fp8_paged_mqa_gather_positions(
+                candidate_positions,
+                harvest_ordinals,
+                harvest_lengths,
+                positions,
+                arch=arch,
+                stream=stream,
+            )
+    else:
+        selected_group_ids = None
+        harvest_lengths = None
+        harvest_ordinals = None
+    return GroupMaxTopKResult(
+        scores=scores,
+        positions=positions,
+        group_max=group_max,
+        group_ends=group_ends,
+        selected_group_scores=None,
+        selected_group_ids=(
+            selected_group_ids
+            if selected_group_ids is not None
+            else torch.empty((rows, k), dtype=torch.int32, device=device)
+        ),
+        selected_group_counts=group_ends,
+        harvest_scores=candidate_scores,
+        harvest_positions=candidate_positions,
+        harvest_lengths=(
+            harvest_lengths
+            if harvest_lengths is not None
+            else torch.zeros((rows,), dtype=torch.int32, device=device)
+        ),
+        harvest_ordinals=(
+            harvest_ordinals
+            if harvest_ordinals is not None
+            else torch.empty((rows, k), dtype=torch.int32, device=device)
+        ),
     )
 
 
