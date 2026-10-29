@@ -190,6 +190,12 @@ def launch_fmoe_blockscale(
     n_turns = D // TURN_N
     n_j = cols // 64  # 16-column MFMA tiles per wave
     n_groups = ROWS // 16
+    # Gate/up phases of a K step, (up, K halves), each with its weights in one
+    # of two ring buffers while the next phase's load. 64 rows run a
+    # projection over both halves; 128 rows (twice the MFMAs per weight byte)
+    # one half at a time, so the ring holds half the bytes for as many MFMAs.
+    halves = [(0, 1)] if ROWS == 64 else [(0,), (1,)]
+    phases = [(up, khs) for khs in halves for up in (False, True)]
     n_t = TURN_N // 64  # 16-column MFMA tiles per wave per down turn
     n_parts = slices * n_groups  # merge parts per turn
     rows_w = ROWS // 4  # relay rows each wave merges
@@ -412,14 +418,13 @@ def launch_fmoe_blockscale(
             [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(n_blk)]
             for _ in range_constexpr(2)
         ]  # [buffer][kb]
-        w_g = [
-            [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(2)]
-            for _ in range_constexpr(n_j)
-        ]
-        w_u = [
-            [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(2)]
-            for _ in range_constexpr(n_j)
-        ]
+        w_gu = [
+            [
+                [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(n_j)]
+                for _ in range_constexpr(len(phases[0][1]))
+            ]
+            for _ in range_constexpr(2)
+        ]  # [buffer][K half of the phase][j]
         w_d = [
             [
                 [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(n_blk)]
@@ -557,19 +562,21 @@ def launch_fmoe_blockscale(
                 fx.copy(atom, fx.slice(src, (None, lane_w + 256)), hi)
                 frag.store(lo.load().shuffle(hi.load(), list(range(8))))
 
-            def matrix_loads(w, s, up, cs):
-                def one(kh, j):
+            def matrix_loads(w, s, phase, cs):
+                up, khs = phase
+
+                def one(k, kh, j):
                     rg = cs * (cols // 16) + wave + 4 * j + (I // 16 if up else 0)
-                    return lambda: load_weights(gu_w, rg, D, s * 4 + kh * 2, w[j][kh])
+                    return lambda: load_weights(gu_w, rg, D, s * 4 + kh * 2, w[k][j])
 
                 return [
-                    one(kh, j)
-                    for kh in range_constexpr(2)
+                    one(k, kh, j)
+                    for k, kh in enumerate(khs)
                     for j in range_constexpr(n_j)
                 ]
 
-            def load_matrix(w, s, up, cs):
-                for f in matrix_loads(w, s, up, cs):
+            def load_matrix(w, s, phase, cs):
+                for f in matrix_loads(w, s, phase, cs):
                     f()
 
             def down_loads(turn, cs, w):
@@ -589,30 +596,24 @@ def launch_fmoe_blockscale(
                 for f in down_loads(turn, cs, w):
                     f()
 
-            # The token B operands of a step, (kh, group) in MFMA order. Each
+            # The token B operands of a phase, (kh, group) in MFMA order. Each
             # is read from the panel one group ahead and lives for its n_j
-            # MFMAs only; the gate and up sweeps each read the panel once.
-            b_order = [
-                (kh, gi)
-                for kh in range_constexpr(2)
-                for gi in range_constexpr(n_groups)
-            ]
-
-            def read_tok(buf, q):
-                kh, gi = b_order[q]
+            # MFMAs only; the gate and up phases each read the panel once.
+            def read_tok(buf, kh, gi):
                 frag = fx.make_rmem_tensor(8, Int32)
                 read_b(buf * (PANEL // 4) + stack_off(kh, gi) // 4, frag)
                 return frag
 
-            def fold(w, acc, ws, xs, side, buf, b0, b_next):
-                """One projection's sweep over the step: ``b0`` is its first B,
+            def fold(w, acc, ws, khs, xs, side, buf, b0, b_next):
+                """One phase's sweep over K halves ``khs``: ``b0`` is its first B,
                 already read; returns ``b_next()``, read during its last group."""
+                order = [(kh, gi) for kh in khs for gi in range_constexpr(n_groups)]
                 frags = {0: b0}
 
                 def ahead(q):
                     def f():
-                        if const_expr(q + 1 < len(b_order)):
-                            frags[q + 1] = read_tok(buf, q + 1)
+                        if const_expr(q + 1 < len(order)):
+                            frags[q + 1] = read_tok(buf, *order[q + 1])
                         else:
                             frags["next"] = b_next()
 
@@ -628,54 +629,61 @@ def launch_fmoe_blockscale(
 
                 mfma_stream(
                     [
-                        (w[j][kh], lambda q=q: frags[q], (kh, j, gi))
-                        for q, (kh, gi) in enumerate(b_order)
+                        (w[k][j], lambda q=q: frags[q], (kh, j, gi))
+                        for q, (kh, gi) in enumerate(order)
                         for j in range_constexpr(n_j)
+                        for k in [khs.index(kh)]
                     ],
                     use,
                     side,
-                    {q * n_j: ahead(q) for q in range_constexpr(len(b_order))},
+                    {q * n_j: ahead(q) for q in range_constexpr(len(order))},
                 )
                 return frags["next"]
 
             def gate_up_prologue(cs):
-                # Gate weights and token scales run a step ahead and land during
-                # the up MFMAs; the up weights land during the gate MFMAs.
+                # Each phase's weights load during the phase before; the step's
+                # first, with the token scales, during the last of the previous.
                 # The DMA goes first: the step's wait then covers it alone.
                 issue_tokens(0, 0)
                 rocdl.sched_barrier(0)
-                load_matrix(w_g, 0, False, cs)
+                load_matrix(w_gu[0], 0, phases[0], cs)
 
             def gate_up_step(s, last, cs):
                 buf = s % 2
                 gq_row = expert * (2 * I // BLK) + cs * (cols // BLK)
-                ws_g = [
+                ws = [
                     [
-                        sload_f32(gq_src, (gq_row + b) * kd + s * 2 + kh)
-                        for b in range_constexpr(cols // BLK)
+                        [
+                            sload_f32(
+                                gq_src,
+                                (gq_row + up * (I // BLK) + b) * kd + s * 2 + kh,
+                            )
+                            for b in range_constexpr(cols // BLK)
+                        ]
+                        for kh in range_constexpr(2)
                     ]
-                    for kh in range_constexpr(2)
-                ]
-                ws_u = [
-                    [
-                        sload_f32(gq_src, (gq_row + I // BLK + b) * kd + s * 2 + kh)
-                        for b in range_constexpr(cols // BLK)
-                    ]
-                    for kh in range_constexpr(2)
+                    for up in range_constexpr(2)
                 ]
                 # vmcnt is in order: waiting for the step's token DMA means
-                # waiting until only the 4 n_j gate-weight loads issued after it
-                # are in flight. Those stay in flight into the gate MFMAs.
-                rocdl.s_waitcnt(vmcnt=4 * n_j)
+                # waiting until only the first phase's weight loads, issued
+                # after it, are in flight. Those stay in flight into its MFMAs.
+                rocdl.s_waitcnt(vmcnt=2 * len(phases[0][1]) * n_j)
                 gpu.barrier()
-                b0 = read_tok(buf, 0)
-                # The up weights and the next step's tokens load during the gate
-                # MFMAs; the next gate weights and token scales during the up.
-                side_g = matrix_loads(w_u, s, True, cs)
-                side_u = []
+                b = read_tok(buf, phases[0][1][0], 0)
+                # Each phase loads the next one's weights; the next step's
+                # tokens load during the second-to-last phase.
+                sides = []
+                for p in range_constexpr(len(phases)):
+                    if const_expr(p + 1 < len(phases)):
+                        sides.append(
+                            matrix_loads(w_gu[(p + 1) % 2], s, phases[p + 1], cs)
+                        )
+                    elif const_expr(not last):
+                        sides.append(matrix_loads(w_gu[0], s + 1, phases[0], cs))
+                    else:
+                        sides.append([])
                 if const_expr(not last):
-                    side_g.append(lambda: issue_tokens(s + 1, 1 - buf))
-                    side_u = matrix_loads(w_g, s + 1, False, cs)
+                    sides[-2].append(lambda: issue_tokens(s + 1, 1 - buf))
                 xs = [
                     fx.ptr_load(
                         fx.add_offset(
@@ -686,12 +694,24 @@ def launch_fmoe_blockscale(
                     for kh in range_constexpr(2)
                     for gi in range_constexpr(n_groups)
                 ]
-                rocdl.sched_barrier(0)
-                b0 = fold(
-                    w_g, acc_g, ws_g, xs, side_g, buf, b0, lambda: read_tok(buf, 0)
-                )
-                rocdl.sched_barrier(0)
-                fold(w_u, acc_u, ws_u, xs, side_u, buf, b0, lambda: None)
+                for p, (up, khs) in enumerate(phases):
+                    if const_expr(p + 1 < len(phases)):
+                        nxt = phases[p + 1][1][0]
+                        b_next = lambda kh=nxt: read_tok(buf, kh, 0)
+                    else:
+                        b_next = lambda: None
+                    rocdl.sched_barrier(0)
+                    b = fold(
+                        w_gu[p % 2],
+                        acc_u if up else acc_g,
+                        ws[up],
+                        khs,
+                        xs,
+                        sides[p],
+                        buf,
+                        b,
+                        b_next,
+                    )
 
             # The tile's column slices run gate/up one after another; each parks
             # its quantized h in its own stage panel for one down pass over all.
