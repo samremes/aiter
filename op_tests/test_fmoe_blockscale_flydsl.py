@@ -115,7 +115,7 @@ def run_asm(c, srt):
 
 
 def run_flydsl(
-    c, srt, tile_n=None, slices=None, rows=64, ws=0, stored=0, admit=0, reduce=True
+    c, srt, tile_n=None, slices=None, rows=64, ws=None, stored=0, admit=0, reduce=True
 ):
     from aiter.ops.flydsl.fmoe_blockscale import fmoe_blockscale_g1u1_flydsl
 
@@ -147,10 +147,10 @@ def run_flydsl(
 
 
 def parse_variant(v, topk):
-    """``ws:stored`` (stored a count or ``k`` for topk), e.g. ``0:0`` (v11),
-    ``2:k``, ``2:4``."""
+    """``ws:stored`` (ws ``a`` for the wrapper default, stored a count or ``k``
+    for topk), e.g. ``0:0`` (v11), ``a:0``, ``2:k``, ``2:4``."""
     ws, st = v.split(":")
-    return int(ws), topk if st == "k" else int(st)
+    return None if ws == "a" else int(ws), topk if st == "k" else int(st)
 
 
 def report(name, out, ref):
@@ -224,7 +224,7 @@ def main():
         choices=[64, 128],
         help="sorted rows per tile (default 64)",
     )
-    p.add_argument("--ws", type=int, default=0, choices=[0, 2])
+    p.add_argument("--ws", default="a", choices=["a", "0", "2"], help="a: default")
     p.add_argument("--stored", default="0", help="partial-stored slots, or k for topk")
     p.add_argument("--admit", type=int, default=0)
     p.add_argument(
@@ -260,7 +260,7 @@ def main():
             o_fly = run_flydsl(
                 c, srt_f, a.tile_n, a.slices, tr, ws, st, a.admit
             ).clone()
-            tag = f"flydsl ws{ws} stored{st}"
+            tag = f"flydsl ws{'a' if ws is None else ws} stored{st}"
             if ref is not None:
                 report(f"{name} {tag} vs ref", o_fly, ref)
             report(f"{name} {tag} vs asm", o_fly, o_asm)
@@ -277,7 +277,7 @@ def main():
             for (ws, st), tv, m in zip(variants, t[1:], med[1:]):
                 ratios = sorted(f / s for f, s in zip(tv, t[0]))
                 line += (
-                    f" | ws{ws}:s{st} {m:.1f} "
+                    f" | ws{'a' if ws is None else ws}:s{st} {m:.1f} "
                     f"({100 * (ratios[len(ratios) // 2] - 1):+.1f}%)"
                 )
             print(line + (" [kernel only]" if a.no_reduce else ""))

@@ -46,6 +46,15 @@ def fmoe_tile_n(inter_dim: int, rows: int = 64) -> int:
     return 384 if inter_dim % 384 == 0 else 256
 
 
+def fmoe_ws(tokens: int, model_dim: int, inter_dim: int, rows: int = 64) -> int:
+    """Default wave split: ping-pong (2) at 7168 x 256 from 2048 tokens, where
+    hiding the output under the next tile's gate/up beats its 256-VGPR squeeze
+    (4.4% at 16384 tokens, 5% at 2048; it loses 9% at 1024); else 0."""
+    if rows == 64 and (model_dim, inter_dim) == (7168, 256) and tokens >= 2048:
+        return 2
+    return 0
+
+
 def fmoe_slices(inter_dim: int, tile_n: int, rows: int = 64, ws: int = 0) -> int:
     """Column slices one tile runs: all of them where they fit, so a token row
     gets one routed partial per expert to merge; else the most that divide
@@ -84,7 +93,7 @@ def fmoe_blockscale_g1u1_flydsl(
     tile_n: int | None = None,
     slices: int | None = None,
     rows: int = 64,
-    ws: int = 0,
+    ws: int | None = None,
     stored: int = 0,
     topk: int | None = None,
     admit: int = 0,
@@ -101,7 +110,8 @@ def fmoe_blockscale_g1u1_flydsl(
 
     ``ws`` 2: ping-pong over eight waves (256 VGPRs a wave, 64 x 256 tiles):
     waves 0-3 run gate/up of tile i while waves 4-7 run down and the output
-    of tile i - 1, so the output spreads over the whole tile.
+    of tile i - 1, so the output spreads over the whole tile. ``None``:
+    per ``fmoe_ws``.
     ``stored``: routing slots (of ``topk``) whose rows the kernel stores into a
     ``[T, stored, D]`` bf16 partial buffer instead of adding them atomically;
     a reduce pass then adds them into ``out`` (``reduce=False`` skips it, for
@@ -111,6 +121,8 @@ def fmoe_blockscale_g1u1_flydsl(
     """
     tokens, model_dim = a_q.shape
     experts, _, inter_dim = w2.shape
+    if ws is None:
+        ws = fmoe_ws(tokens, model_dim, inter_dim, rows)
     if tile_n is None:
         tile_n = 256 if ws else fmoe_tile_n(inter_dim, rows)
     if slices is None:
@@ -201,4 +213,5 @@ __all__ = [
     "fmoe_reduce",
     "fmoe_slices",
     "fmoe_tile_n",
+    "fmoe_ws",
 ]

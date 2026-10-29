@@ -105,7 +105,8 @@ FP8_MAX = 448.0
 ADMIT_WAIT = 5000  # longest down-admission wait, 100 MHz ticks (50 us)
 LDS_MAX = 160 * 1024
 # Profiling knockouts (wrong results, tagged in the kernel name):
-# FMOE_KO=atomic drops the whole output (atomics and partial stores).
+# FMOE_KO=atomic drops the whole output (atomics and partial stores);
+# compute drops the MFMAs, weight loads and token DMA (the output stays).
 KO = set(filter(None, os.environ.get("FMOE_KO", "").split(",")))
 # Slice widths by tile rows: 64 rows take 256 or 384 columns; 128 rows take
 # 128, so the accumulators stay at 128 registers.
@@ -485,6 +486,8 @@ def launch_fmoe_blockscale(
         unit = fx.Int32(127)  # e8m0 1.0
 
         def product(a, b):
+            if const_expr("compute" in KO):
+                return zero.load()
             prod = fx.make_rmem_tensor(4, Float32)
             fx.gemm(mma, prod, a, b, zero, scale_a=unit, scale_b=unit)
             return prod.load()
@@ -801,6 +804,8 @@ def launch_fmoe_blockscale(
             ]
 
             def issue_tokens(s, buf):
+                if const_expr("compute" in KO):
+                    return
                 for kh in range_constexpr(2):
                     for q in range_constexpr(n_dma):
                         for b in range_constexpr(2):
@@ -843,6 +848,8 @@ def launch_fmoe_blockscale(
             lane_w = lane * 4  # i32
 
             def load_weights(src, rg, k_rows, plane, frag):
+                if const_expr("compute" in KO):
+                    return
                 atom = load_w.set_value(
                     "soffset", rg * (16 * k_rows // 4) + plane * 256
                 )
@@ -1206,8 +1213,16 @@ def launch_fmoe_blockscale(
                         # so the products of a group fold under the next group's.
                         per = n_t * n_blk
 
+                        # Ping-pong: a unit issues its weight loads before the
+                        # merge atomics, so the next unit's (in-order) vmcnt
+                        # wait skips them (~0.5% at 7168 x 256; ws 0 loses 3%).
+                        early = pp
+
                         def at_group(gi):
                             def f():
+                                if const_expr(early and gi == 0):
+                                    for g in side:
+                                        g()
                                 if const_expr(gi > 0 and prev is not None):
                                     merge(
                                         prev, 1 - slot, sl * n_groups + gi - 1, n_parts
@@ -1226,7 +1241,7 @@ def launch_fmoe_blockscale(
                                 for kb in range_constexpr(n_blk)
                             ],
                             use,
-                            side,
+                            [side, []][early],
                             {
                                 gi * per: at_group(gi)
                                 for gi in range_constexpr(n_groups)
@@ -1241,12 +1256,14 @@ def launch_fmoe_blockscale(
                 # block a slice, each closed by a barrier that matches gate/up's
                 # amax exchange.
                 u1 = slices % 2  # the second turn's first weight buffer
-                per = n_turns // slices if const_expr(pp) else n_turns
+                blk_turns = n_turns // slices if const_expr(pp) else n_turns
                 for blk in range_constexpr(slices if pp else 1):
                     if const_expr(blk == 0):
                         down_turn(fx.Int32(0), 0, 0, None)
                         down_turn(fx.Int32(1), 1, u1, fx.Int32(0))
-                    for pair in range(max(1, blk * per // 2), (blk + 1) * per // 2):
+                    for pair in range(
+                        max(1, blk * blk_turns // 2), (blk + 1) * blk_turns // 2
+                    ):
                         turn = pair * 2
                         down_turn(turn, 0, 0, turn - 1)
                         down_turn(turn + 1, 1, u1, turn)
