@@ -6,8 +6,9 @@
 
 The FlyDSL counterpart of the asm ``fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps``
 kernels: gate/up GEMM, silu(gate) * up, a per-token 1x128 fp8 requant, the down
-GEMM and the routed bf16 merge into the output, per 64-row sorted block and
-``slices * cols`` intermediate columns.
+GEMM and the routed bf16 merge into the output, per sorted block of ``rows``
+(64, or 128 at experimental 128- or 256-column slices) and ``slices * cols``
+intermediate columns. 128 rows halve the weight bytes per MFMA.
 
 ===========  ========================  =====================================
 operand      shape                     notes
@@ -21,30 +22,32 @@ operand      shape                     notes
 ``O``        ``[T, D]`` bf16           pre-zeroed; routed rows add atomically
 ===========  ========================  =====================================
 
-Sorting is aiter ``moe_sorting`` with block 64: ``sorted_ids`` holds
+Sorting is aiter ``moe_sorting`` with block ``rows``: ``sorted_ids`` holds
 ``token | slot << 24`` (padding rows hold token T), ``sorted_expert_ids`` one
-expert per 64-row block and ``num_valid_ids[0]`` the sorted row count.
+expert per row block and ``num_valid_ids[0]`` the sorted row count.
 
 Work split. A tile is (row block, ``slices`` column slices of ``cols``, 256 or
 384): gate/up runs slice by slice, each leaving its quantized h in its own LDS
 panel, then one down pass contracts over all of them (K = ``slices * cols``),
 so the output atomics happen once a tile. One workgroup per CU walks the tiles
 persistently, each XCD a contiguous run. Four waves split the columns: wave w
-owns the 16-column MFMA tiles ``64 j + 16 w``, all 64 tokens.
+owns the 16-column MFMA tiles ``64 j + 16 w``, all the tile's tokens.
 MFMA 16x16x128 takes the weights as A and the tokens as B, so C lane l holds
 token ``l % 16`` and the four weight rows ``4 (l // 16) + r``.
 
-Token panel (LDS). One K step is 256 K: two 128-K halves (kh) of four 16-token
-groups, a 128-byte row per token, 16 KiB, double buffered. Its 16-byte chunks
+Token panel (LDS). One K step is 256 K: two 128-K halves (kh) of ``rows / 16``
+16-token groups, a 128-byte row per token, ``rows / 4`` KiB, double buffered.
+Wave w gathers groups ``w + 4 q``. Its 16-byte chunks
 carry the Swizzle(3, 4, 4) of the dense row-major panel (chunk ^= (row >> 1) & 7),
 so the 16 token rows a B read spans hit distinct banks. The gather is LDS DMA:
 lane l lands 16 bytes at ``base + 16 l`` and fetches the logical chunk that the
 swizzle maps there. The quantized h reuses the same panel layout (staging) as
 the down GEMM's B operand.
 
-Down. A turn is 256 output columns: wave w owns ``64 t + 16 w``. The bf16
-results go through an LDS relay, then each wave adds its own 16 token rows into
-O with packed bf16 buffer atomics; padding rows land past O's records and drop.
+Down. A turn is 256 output columns at 64 rows, 128 at 128 (two relay slots
+fit): wave w owns ``64 t + 16 w``. The bf16 results go through an LDS relay,
+then each wave adds its own ``rows / 4`` token rows into O with packed bf16
+buffer atomics; padding rows land past O's records and drop.
 Turn t's merge interleaves with turn t + 1's MFMAs.
 
 Down admission. Down is bound by the device-wide atomic throughput, and with
@@ -78,46 +81,66 @@ from aiter.ops.flydsl.kernels.kernels_common import LOG2E, format_kernel_name
 
 WAVE = 64
 THREADS = 256
-ROWS = 64  # sorted rows per tile (moe_sorting block)
+ROW_TILES = (64, 128)  # sorted rows per tile (the moe_sorting block)
 BLK = 128  # scale block edge
 STEP_K = 256  # K per gate/up step: two 128-K halves
-TURN_N = 256  # down output columns per turn
 MFMA_LAG = 3  # products in flight before the first fold reads one
 FP8_MAX = 448.0
 ADMIT_WAIT = 5000  # longest down-admission wait, 100 MHz ticks (50 us)
-
-# LDS map, bytes. The down relay overlays the gate/up token panels, which are
-# dead by then; at offset 0 every relay access folds its constant part into the
-# 16-bit ds offset. The h panels (the down B operand) sit above it.
-PANEL = 16 * 1024  # one token panel: (kh 2, group 4, token 16, 128 B)
-RELAY_PITCH = TURN_N + 8  # bf16 per relay row; the pad staggers banks
-OFF_RELAY = 0
-RELAY = ROWS * RELAY_PITCH * 2
-OFF_STAGE = OFF_RELAY + 2 * RELAY  # one h panel per column slice
-H_BLOCK = 8 * 1024  # one 128-K block of an h panel: (group 4, token 16, 128 B)
-# The requant's amax scratch, f32 [wave 4][block <= 3][token 64], also overlays
-# the relay, past the token panels the next slice's prologue fills.
-OFF_AMAX = 2 * PANEL
-# The token scales of a step, f32 [buffer 2][kh 2][token 64], DMA'd with the
-# token panels; past the amax scratch, which is live during the next prologue.
-OFF_XS = OFF_AMAX + 4 * 3 * ROWS * 4
-assert OFF_XS + 2 * 2 * ROWS * 4 <= OFF_STAGE and OFF_STAGE % 1024 == 0
-COLS = (256, 384)  # columns of one slice
+LDS_MAX = 160 * 1024
+# Slice widths by tile rows: 64 rows take 256 or 384 columns; 128 rows take
+# 128, so the accumulators stay at 128 registers.
+COLS = {64: (256, 384), 128: (128, 256)}
+MAX_SLICES = {64: 3, 128: 6}
 
 
-def lds_bytes(cols, slices):
-    return OFF_STAGE + slices * (cols // BLK) * H_BLOCK
+class Geometry:
+    """The tile's LDS map, bytes. The down relay overlays the gate/up token
+    panels, which are dead by then; at offset 0 every relay access folds its
+    constant part into the 16-bit ds offset. The h panels (the down B operand)
+    sit above it."""
+
+    def __init__(self, rows, cols, slices):
+        self.rows = rows
+        # Down output columns per turn: two relay slots of rows x turn_n bf16
+        # must fit beside the h panels.
+        self.turn_n = 256 if rows == 64 else 128
+        # One token panel: (kh 2, group rows / 16, token 16, 128 B).
+        self.panel = rows * STEP_K
+        self.relay_pitch = self.turn_n + 8  # bf16 per relay row; the pad staggers banks
+        self.relay = rows * self.relay_pitch * 2
+        # One 128-K block of an h panel: (group rows / 16, token 16, 128 B).
+        self.h_block = rows * BLK
+        # The requant's amax scratch, f32 [wave 4][block][token], also overlays
+        # the relay, past the token panels the next slice's prologue fills.
+        self.off_amax = 2 * self.panel
+        # The token scales of a step, f32 [buffer 2][kh 2][token], DMA'd with
+        # the token panels; past the amax scratch, which is live during the
+        # next prologue.
+        self.off_xs = self.off_amax + 4 * (cols // BLK) * rows * 4
+        end = self.off_xs + 2 * 2 * rows * 4
+        self.off_stage = -(-max(end, 2 * self.relay) // 1024) * 1024
+        self.lds = self.off_stage + slices * (cols // BLK) * self.h_block
 
 
-def check_config(model_dim, inter_dim, cols, slices=1):
-    if cols not in COLS:
-        raise ValueError(f"cols {cols}: the slice width is one of {COLS}")
-    if slices not in (1, 2, 3) or inter_dim % (cols * slices):
+def lds_bytes(rows, cols, slices):
+    return Geometry(rows, cols, slices).lds
+
+
+def check_config(model_dim, inter_dim, cols, slices=1, rows=64):
+    if rows not in ROW_TILES:
+        raise ValueError(f"rows {rows}: the tile rows are one of {ROW_TILES}")
+    if cols not in COLS[rows]:
+        raise ValueError(f"cols {cols}: {rows}-row slices are one of {COLS[rows]}")
+    if not 1 <= slices <= MAX_SLICES[rows] or inter_dim % (cols * slices):
         raise ValueError(
             f"inter_dim {inter_dim} does not split into {slices} slices of {cols} columns"
         )
-    if model_dim % (2 * TURN_N):
-        raise ValueError(f"model_dim {model_dim} is not a multiple of {2 * TURN_N}")
+    turn_n = Geometry(rows, cols, slices).turn_n
+    if model_dim % (2 * turn_n):
+        raise ValueError(f"model_dim {model_dim} is not a multiple of {2 * turn_n}")
+    if lds_bytes(rows, cols, slices) > LDS_MAX:
+        raise ValueError(f"{rows}x{cols}x{slices}: the LDS map exceeds {LDS_MAX}")
 
 
 @flyc.jit
@@ -142,20 +165,36 @@ def launch_fmoe_blockscale(
     cols: Constexpr[int],
     slices: Constexpr[int],
     grid: Constexpr[int],
+    rows: Constexpr[int] = 64,
 ):
-    check_config(D, I, cols, slices)
+    check_config(D, I, cols, slices, rows)
+    geo = Geometry(rows, cols, slices)
+    ROWS = rows
+    TURN_N = geo.turn_n
+    PANEL = geo.panel
+    RELAY = geo.relay
+    RELAY_PITCH = geo.relay_pitch
+    H_BLOCK = geo.h_block
+    OFF_AMAX = geo.off_amax
+    OFF_XS = geo.off_xs
+    OFF_STAGE = geo.off_stage
+    ARENA = geo.lds
     ps_deno = I // (cols * slices)  # column tiles per row block
-    ARENA = lds_bytes(cols, slices)
     assert grid % 16 == 0 and grid % ps_deno == 0
     # Workgroups let into down at once. Down is bound by the device's atomic
     # throughput and moves the same output bytes per tile whatever its width,
     # so narrower tiles (less MFMA per tile) admit fewer: (2 + n) / 8 of the
     # grid for n * 256 columns.
-    down_limit = grid * (2 * TURN_N + slices * cols) // (8 * TURN_N)
+    down_limit = grid * (512 + slices * cols) // 2048
     n_steps = D // STEP_K
     n_turns = D // TURN_N
     n_j = cols // 64  # 16-column MFMA tiles per wave
     n_groups = ROWS // 16
+    n_t = TURN_N // 64  # 16-column MFMA tiles per wave per down turn
+    n_parts = slices * n_groups  # merge parts per turn
+    rows_w = ROWS // 4  # relay rows each wave merges
+    pieces = TURN_N // 128  # 128-column runs of a relay row
+    n_dma = n_groups // 4  # token groups each wave gathers
     kd = D // BLK  # K blocks of the gate/up GEMM
     ki = I // BLK  # K blocks of the down GEMM
     n_blk = cols // BLK  # 128-column blocks of a slice: down K blocks, scale rows
@@ -259,7 +298,7 @@ def launch_fmoe_blockscale(
             return fx.get_scalar(fx.crd2idx((t, byte), panel_swz))
 
         def stack_off(kh, gi):
-            return kh * 8192 + gi * 2048
+            return kh * H_BLOCK + gi * 2048
 
         # B reads: token lane16, 16-byte chunks kgrp and 4 + kgrp (the f8f6f4
         # operand pairs halves 64 K apart).
@@ -320,9 +359,9 @@ def launch_fmoe_blockscale(
         # merge as two dwords a lane per row), in their element units.
         amax_w = opaque(OFF_AMAX // 4 + wave * (n_blk * ROWS) + lane16)
         amax_r = opaque(OFF_AMAX // 4 + lane16)
-        relay_w = opaque(OFF_RELAY // 2 + lane16 * RELAY_PITCH + wave * 16 + kgrp * 4)
+        relay_w = opaque(lane16 * RELAY_PITCH + wave * 16 + kgrp * 4)
         xs_r = OFF_XS // 4 + lane16
-        relay_r = opaque(OFF_RELAY // 4 + wave * (16 * RELAY_PITCH // 2) + lane)
+        relay_r = opaque(wave * (rows_w * RELAY_PITCH // 2) + lane)
 
         mma = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
@@ -384,7 +423,7 @@ def launch_fmoe_blockscale(
         w_d = [
             [
                 [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(n_blk)]
-                for _ in range_constexpr(4)
+                for _ in range_constexpr(n_t)
             ]
             for _ in range_constexpr(2)
         ]  # [buffer][t][kb]
@@ -447,20 +486,19 @@ def launch_fmoe_blockscale(
             gu_w = _buffer(arg_gu + e64 * (2 * I * D), T.i32, 16, fx.Int64(2 * I * D))
             dw_w = _buffer(arg_dw + e64 * (D * I), T.i32, 16, fx.Int64(D * I))
 
-            # Wave w gathers token group w: rows 16 w + 8 b + (l >> 3).
+            # Wave w gathers token groups w + 4 q: rows 16 (w + 4 q) + 8 b + (l >> 3).
             dma_src = []
-            for b in range_constexpr(2):
-                tok = (
-                    vload(
-                        load_i32, ids_src, row0 + wave * 16 + b * 8 + lane // 8, Int32
-                    )
-                    & 0xFFFFFF
-                )
-                dma_src.append(tok * D + dma_byte[b])
-            # The token-scale DMA's lane token, row l (the padding token clamps
-            # to a real one: its products are zero anyway); routing weights of
-            # the B lanes, group gi.
-            tok = vload(load_i32, ids_src, row0 + lane, Int32) & 0xFFFFFF
+            for q in range_constexpr(n_dma):
+                for b in range_constexpr(2):
+                    row = row0 + (wave + 4 * q) * 16 + b * 8 + lane // 8
+                    tok = vload(load_i32, ids_src, row, Int32) & 0xFFFFFF
+                    dma_src.append(tok * D + dma_byte[b])
+            # The token-scale DMA: wave w moves half kh = w & 1 of rows
+            # 64 xh + l, xh = (w >> 1) % (rows / 64) (at 64 rows waves 2, 3
+            # repeat 0, 1). The padding token clamps to a real one: its
+            # products are zero anyway. Routing weights of the B lanes, group gi.
+            xh = wave // 2 % (ROWS // 64)
+            tok = vload(load_i32, ids_src, row0 + xh * 64 + lane, Int32) & 0xFFFFFF
             tok_x = (tok < i32_tokens).select(tok, i32_tokens - 1)
             rw_b = [
                 vload(load_f32, rw_src, row0 + gi * 16 + lane16, Float32)
@@ -469,25 +507,30 @@ def launch_fmoe_blockscale(
 
             def issue_tokens(s, buf):
                 for kh in range_constexpr(2):
-                    for b in range_constexpr(2):
-                        lds_off = (
-                            buf * PANEL + stack_off(kh, 0) + wave * 2048 + b * 1024
-                        )
-                        dst = fx.make_view(
-                            fx.add_offset(lds_i8, rocdl.readfirstlane(T.i32, lds_off)),
-                            fx.make_layout(1, 1),
-                        )
-                        fx.copy(
-                            dma16.set_value("soffset", (s * 2 + kh) * BLK),
-                            fx.slice(x_src, (None, dma_src[b])),
-                            dst,
-                        )
-                # Token scales of half kh = wave & 1 (waves 2, 3 repeat 0, 1).
+                    for q in range_constexpr(n_dma):
+                        for b in range_constexpr(2):
+                            lds_off = (
+                                buf * PANEL
+                                + stack_off(kh, 0)
+                                + (wave + 4 * q) * 2048
+                                + b * 1024
+                            )
+                            dst = fx.make_view(
+                                fx.add_offset(
+                                    lds_i8, rocdl.readfirstlane(T.i32, lds_off)
+                                ),
+                                fx.make_layout(1, 1),
+                            )
+                            fx.copy(
+                                dma16.set_value("soffset", (s * 2 + kh) * BLK),
+                                fx.slice(x_src, (None, dma_src[q * 2 + b])),
+                                dst,
+                            )
                 xs_dst = fx.make_view(
                     fx.add_offset(
                         lds_f32,
                         rocdl.readfirstlane(
-                            T.i32, OFF_XS // 4 + (buf * 2 + wave % 2) * ROWS
+                            T.i32, OFF_XS // 4 + (buf * 2 + wave % 2) * ROWS + xh * 64
                         ),
                     ),
                     fx.make_layout(1, 1),
@@ -538,7 +581,7 @@ def launch_fmoe_blockscale(
 
                 return [
                     one(t, kb)
-                    for t in range_constexpr(4)
+                    for t in range_constexpr(n_t)
                     for kb in range_constexpr(n_blk)
                 ]
 
@@ -745,16 +788,20 @@ def launch_fmoe_blockscale(
                 sem_add(1)
             gpu.barrier()
 
-            # The wave's 16 relay rows: its token ids, wave-uniform.
+            # The wave's relay rows: its token ids, wave-uniform.
             out_tok = [
-                sload(ids_src, row0 + wave * 16 + i) & 0xFFFFFF
-                for i in range_constexpr(16)
+                sload(ids_src, row0 + wave * rows_w + i) & 0xFFFFFF
+                for i in range_constexpr(rows_w)
             ]
+            n_runs = rows_w * pieces
 
             def merge(turn, slot, part, n_part):
                 """Adds part ``part`` of ``n_part`` of the wave's relay rows into O:
-                two dwords a row a lane, each atomic one contiguous 256-byte run."""
-                sel = list(range(32))[part * 32 // n_part : (part + 1) * 32 // n_part]
+                a dword a 128-column run a lane, each atomic one contiguous
+                256-byte run."""
+                sel = list(range(n_runs))[
+                    part * n_runs // n_part : (part + 1) * n_runs // n_part
+                ]
                 pairs = [
                     fx.ptr_load(
                         fx.add_offset(
@@ -762,8 +809,8 @@ def launch_fmoe_blockscale(
                             relay_r
                             + (
                                 slot * RELAY // 4
-                                + i // 2 * (RELAY_PITCH // 2)
-                                + i % 2 * 64
+                                + i // pieces * (RELAY_PITCH // 2)
+                                + i % pieces * 64
                             ),
                         )
                     )
@@ -773,13 +820,15 @@ def launch_fmoe_blockscale(
                 # voffset, the only part the range check sees.
                 atom = atomic_bf16x2.set_value("soffset", turn * TURN_N)
                 for i, pair in zip(sel, pairs):
-                    col = (i % 2) * 128 + lane * 2
+                    col = (i % pieces) * 128 + lane * 2
                     frag = fx.make_rmem_tensor(2, BFloat16)
                     frag.store(
                         Vec.from_elements([Int32(pair)], dtype=Int32).bitcast(BFloat16)
                     )
                     fx.copy(
-                        atom, frag, fx.slice(o_dst, (None, out_tok[i // 2] * D + col))
+                        atom,
+                        frag,
+                        fx.slice(o_dst, (None, out_tok[i // pieces] * D + col)),
                     )
 
             def down_turn(turn, slot, u0, prev):
@@ -833,7 +882,7 @@ def launch_fmoe_blockscale(
                             )
                             for kb in range_constexpr(n_blk)
                         ]
-                        for t in range_constexpr(4)
+                        for t in range_constexpr(n_t)
                     ]
 
                     def read_dn(gi, frags):
@@ -846,23 +895,34 @@ def launch_fmoe_blockscale(
                             )
 
                     # Token group major: a group's B is read from the h panel one
-                    # group ahead and lives for its eight MFMAs only.
+                    # group ahead and lives for its n_t * n_blk MFMAs only; the
+                    # merge of the previous turn follows each group. One stream,
+                    # so the products of a group fold under the next group's.
+                    per = n_t * n_blk
+
+                    def at_group(gi):
+                        def f():
+                            if const_expr(gi > 0 and prev is not None):
+                                merge(prev, 1 - slot, sl * n_groups + gi - 1, n_parts)
+                            if const_expr(gi + 1 < n_groups):
+                                read_dn(gi + 1, b_dn[(gi + 1) % 2])
+
+                        return f
+
                     read_dn(0, b_dn[0])
-                    for gi in range_constexpr(n_groups):
-                        if const_expr(gi + 1 < n_groups):
-                            read_dn(gi + 1, b_dn[(gi + 1) % 2])
-                        b = b_dn[gi % 2]
-                        mfma_stream(
-                            [
-                                (w[t][kb], b[kb], (t, gi, kb, ws[t][kb]))
-                                for t in range_constexpr(4)
-                                for kb in range_constexpr(n_blk)
-                            ],
-                            use,
-                            side[gi * n_blk : (gi + 1) * n_blk],
-                        )
-                        if const_expr(prev is not None):
-                            merge(prev, 1 - slot, sl * 4 + gi, 4 * slices)
+                    mfma_stream(
+                        [
+                            (w[t][kb], b_dn[gi % 2][kb], (t, gi, kb, ws[t][kb]))
+                            for gi in range_constexpr(n_groups)
+                            for t in range_constexpr(n_t)
+                            for kb in range_constexpr(n_blk)
+                        ],
+                        use,
+                        side,
+                        {gi * per: at_group(gi) for gi in range_constexpr(n_groups)},
+                    )
+                    if const_expr(prev is not None):
+                        merge(prev, 1 - slot, sl * n_groups + n_groups - 1, n_parts)
                 gpu.barrier()
 
             # Turns go in pairs so the relay slots alternate; turn t's merge runs
@@ -875,6 +935,8 @@ def launch_fmoe_blockscale(
                 down_turn(turn, 0, 0, turn - 1)
                 down_turn(turn + 1, 1, u1, turn)
             merge(fx.Int32(n_turns - 1), 1, 0, 1)
+            # The next tile's first DMA lands in the relay: all merges first.
+            gpu.barrier()
             if tid == 0:
                 sem_add(-1)
 

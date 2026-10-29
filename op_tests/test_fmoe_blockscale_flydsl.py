@@ -114,7 +114,7 @@ def run_asm(c, srt):
     return out
 
 
-def run_flydsl(c, srt, tile_n=None, slices=None):
+def run_flydsl(c, srt, tile_n=None, slices=None, rows=64):
     from aiter.ops.flydsl.fmoe_blockscale import fmoe_blockscale_g1u1_flydsl
 
     sti, sw, sei, nvi, out = srt
@@ -133,6 +133,7 @@ def run_flydsl(c, srt, tile_n=None, slices=None):
         c["w2_s"],
         tile_n=tile_n,
         slices=slices,
+        rows=rows,
     )
     return out
 
@@ -193,7 +194,7 @@ def main():
     p.add_argument(
         "--tile-n",
         type=int,
-        choices=[256, 384],
+        choices=[128, 256, 384],
         help="column slice width (default: the wrapper's pick)",
     )
     p.add_argument("--rounds", type=int, default=21)
@@ -201,6 +202,12 @@ def main():
         "--slices",
         type=int,
         help="column slices per tile (default: the wrapper's pick)",
+    )
+    p.add_argument(
+        "--tile-rows",
+        type=int,
+        choices=[64, 128],
+        help="sorted rows per tile (default 64)",
     )
     a = p.parse_args()
     rows = {"custom": tuple(a.shape)} if a.shape else {r: ROWS[r] for r in a.rows}
@@ -213,7 +220,10 @@ def main():
             report(f"{name} asm vs ref", o_asm, ref)
         if a.mode == "asm":
             continue
-        o_fly = run_flydsl(c, srt, a.tile_n, a.slices).clone()
+        tr = a.tile_rows or 64
+        srt_f = srt if tr == 64 else sort(c, tr)
+        print(f"[info] {name}: flydsl tile rows {tr}")
+        o_fly = run_flydsl(c, srt_f, a.tile_n, a.slices, tr).clone()
         if ref is not None:
             report(f"{name} flydsl vs ref", o_fly, ref)
         report(f"{name} flydsl vs asm", o_fly, o_asm)
@@ -221,7 +231,9 @@ def main():
             t = time_pair(
                 [
                     lambda c=c, srt=srt: run_asm(c, srt),
-                    lambda c=c, srt=srt: run_flydsl(c, srt, a.tile_n, a.slices),
+                    lambda c=c, srt=srt_f, tr=tr: run_flydsl(
+                        c, srt, a.tile_n, a.slices, tr
+                    ),
                 ],
                 rounds=a.rounds,
             )

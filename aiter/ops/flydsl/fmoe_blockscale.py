@@ -11,13 +11,19 @@ import flydsl.compiler as flyc
 import torch
 from torch import Tensor
 
-from .kernels.fmoe_blockscale_gfx950 import ROWS, check_config, launch_fmoe_blockscale
+from .kernels.fmoe_blockscale_gfx950 import (
+    LDS_MAX,
+    MAX_SLICES,
+    check_config,
+    launch_fmoe_blockscale,
+    lds_bytes,
+)
 from .kernels.kernels_common import set_slp_vectorize_once_used
 from .kernels.tensor_shim import _compile_and_run, ptr_arg
 
 set_slp_vectorize_once_used(launch_fmoe_blockscale, False)
 
-# Compiled launchers by their Constexprs (D, I, cols, slices, grid).
+# Compiled launchers by their Constexprs (D, I, cols, slices, grid, rows).
 _COMPILED: dict[tuple, flyc.CompiledFunction] = {}
 _SEM: dict[torch.device, Tensor] = {}
 
@@ -30,17 +36,25 @@ def _semaphore(device: torch.device) -> Tensor:
     return sem
 
 
-def fmoe_tile_n(inter_dim: int) -> int:
-    """Slice width: 384 where it divides inter_dim (fewer token reads per
-    tile, measured faster), else 256."""
+def fmoe_tile_n(inter_dim: int, rows: int = 64) -> int:
+    """Slice width: 128 at 128 rows; at 64, 384 where it divides inter_dim
+    (fewer token reads per tile, measured faster), else 256."""
+    if rows == 128:
+        return 128
     return 384 if inter_dim % 384 == 0 else 256
 
 
-def fmoe_slices(inter_dim: int, tile_n: int) -> int:
-    """Column slices one tile runs: all of them up to three, so a token row
-    gets one routed partial per expert to merge; else two where they pair up."""
+def fmoe_slices(inter_dim: int, tile_n: int, rows: int = 64) -> int:
+    """Column slices one tile runs: all of them where they fit, so a token row
+    gets one routed partial per expert to merge; else the most that divide
+    them and fit the LDS."""
     n = inter_dim // tile_n
-    return n if n <= 3 else 2 if n % 2 == 0 else 1
+    for s in range(min(n, MAX_SLICES[rows]), 0, -1):
+        if n % s == 0 and lds_bytes(rows, tile_n, s) <= LDS_MAX:
+            if rows == 64 and s < n and s % 2:
+                continue  # 64 rows: two where they pair up, else one
+            return s
+    return 1
 
 
 def fmoe_grid(
@@ -67,24 +81,25 @@ def fmoe_blockscale_g1u1_flydsl(
     w2_scale: Tensor,
     tile_n: int | None = None,
     slices: int | None = None,
+    rows: int = 64,
 ) -> Tensor:
     """``out[t] += sum_k w_k * down(silu(gate(x_t)) * up(x_t))`` for sorted
-    64-row blocks; ``out`` must be zeroed by the caller.
+    ``rows``-row blocks; ``out`` must be zeroed by the caller.
 
     ``a_q`` ``[T, D]`` fp8 with ``a_scale`` ``[D/128, T]``; ``w1`` ``[E, 2I, D]``
     and ``w2`` ``[E, D, I]`` fp8 preshuffled (16, 16), with 128x128 block scales
     ``w1_scale`` ``[E, 2I/128, D/128]`` and ``w2_scale`` ``[E, D/128, I/128]``.
-    The sort is ``moe_sorting`` with block 64.
+    The sort is ``moe_sorting`` with block ``rows`` (64; 128 is experimental).
     """
     tokens, model_dim = a_q.shape
     experts, _, inter_dim = w2.shape
     if tile_n is None:
-        tile_n = fmoe_tile_n(inter_dim)
+        tile_n = fmoe_tile_n(inter_dim, rows)
     if slices is None:
-        slices = fmoe_slices(inter_dim, tile_n)
-    check_config(model_dim, inter_dim, tile_n, slices)
+        slices = fmoe_slices(inter_dim, tile_n, rows)
+    check_config(model_dim, inter_dim, tile_n, slices, rows)
     grid = fmoe_grid(a_q.device, inter_dim, tile_n, slices)
-    constexprs = (model_dim, inter_dim, tile_n, slices, grid)
+    constexprs = (model_dim, inter_dim, tile_n, slices, grid, rows)
     tensors = (
         out,
         a_q,
@@ -112,7 +127,6 @@ def fmoe_blockscale_g1u1_flydsl(
 
 
 __all__ = [
-    "ROWS",
     "fmoe_blockscale_g1u1_flydsl",
     "fmoe_grid",
     "fmoe_slices",
