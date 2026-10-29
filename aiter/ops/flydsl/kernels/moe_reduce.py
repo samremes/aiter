@@ -3,7 +3,7 @@
 
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
-``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
+``Y[t, d] = sum_k X[t, k, d]`` (``+= `` with ``accumulate``, dense dtypes), optionally gated by the EP validity mask
 (``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
 with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
@@ -48,6 +48,7 @@ def _moe_reduction_body(
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
     NTHREADS: fx.Constexpr[int],
+    accumulate: fx.Constexpr[bool] = False,
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -162,6 +163,14 @@ def _moe_reduction_body(
                 scales.append((e8m0 << 23).bitcast(fx.Float32))
 
         acc = fx.full(V, 0.0, fx.Float32)
+        if const_expr(accumulate):
+            # Y's partial sum (e.g. a kernel's atomics) joins the topk rows.
+            y_src = thr_load.partition_S(
+                fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
+            )
+            yfrag = fx.make_fragment_like(y_src)
+            fx.copy(load_atom, y_src, yfrag)
+            acc = fx.Vector(fx.memref_load_vec(yfrag)).to(fx.Float32)
         for k in range_constexpr(topk):
             if const_expr(is_fp8):
                 vk = _decode_fp8(frags[k], scales[k])
@@ -211,14 +220,17 @@ def compile_moe_reduction(
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    accumulate: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
     Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
     i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
-    stays correct.
+    stays correct. ``accumulate`` (dense dtypes) adds the rows into Y's contents.
     """
+    if accumulate and dtype_str == "fp8":
+        raise ValueError("accumulate supports the dense dtypes only")
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     block = _pick_reduce_block(model_dim, V)
     gy = ceildiv(model_dim, block * V)
@@ -238,6 +250,7 @@ def compile_moe_reduction(
         f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
         f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
+        + ("_acc" if accumulate else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -266,6 +279,7 @@ def compile_moe_reduction(
             scale_blk,
             fp8_row_stride,
             block,
+            accumulate,
         )
 
     @flyc.jit

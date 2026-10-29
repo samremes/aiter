@@ -114,11 +114,14 @@ def run_asm(c, srt):
     return out
 
 
-def run_flydsl(c, srt, tile_n=None, slices=None, rows=64):
+def run_flydsl(
+    c, srt, tile_n=None, slices=None, rows=64, ws=0, stored=0, admit=0, reduce=True
+):
     from aiter.ops.flydsl.fmoe_blockscale import fmoe_blockscale_g1u1_flydsl
 
     sti, sw, sei, nvi, out = srt
-    out.zero_()
+    if stored < c["topk"] or not reduce:
+        out.zero_()  # stored == topk: the reduce writes all of out
     fmoe_blockscale_g1u1_flydsl(
         out,
         c["a_q"],
@@ -134,8 +137,20 @@ def run_flydsl(c, srt, tile_n=None, slices=None, rows=64):
         tile_n=tile_n,
         slices=slices,
         rows=rows,
+        ws=ws,
+        stored=stored,
+        topk=c["topk"],
+        admit=admit,
+        reduce=reduce,
     )
     return out
+
+
+def parse_variant(v, topk):
+    """``ws:stored`` (stored a count or ``k`` for topk), e.g. ``0:0`` (v11),
+    ``2:k``, ``2:4``."""
+    ws, st = v.split(":")
+    return int(ws), topk if st == "k" else int(st)
 
 
 def report(name, out, ref):
@@ -209,6 +224,19 @@ def main():
         choices=[64, 128],
         help="sorted rows per tile (default 64)",
     )
+    p.add_argument("--ws", type=int, default=0, choices=[0, 2])
+    p.add_argument("--stored", default="0", help="partial-stored slots, or k for topk")
+    p.add_argument("--admit", type=int, default=0)
+    p.add_argument(
+        "--no-reduce",
+        action="store_true",
+        help="bench: time the kernel alone (no reduce pass; wrong results)",
+    )
+    p.add_argument(
+        "--variants",
+        nargs="*",
+        help="bench several ws:stored variants against asm (e.g. 0:0 2:k 2:4 2:0)",
+    )
     a = p.parse_args()
     rows = {"custom": tuple(a.shape)} if a.shape else {r: ROWS[r] for r in a.rows}
     for name, shape in rows.items():
@@ -223,16 +251,43 @@ def main():
         tr = a.tile_rows or 64
         srt_f = srt if tr == 64 else sort(c, tr)
         print(f"[info] {name}: flydsl tile rows {tr}")
-        o_fly = run_flydsl(c, srt_f, a.tile_n, a.slices, tr).clone()
-        if ref is not None:
-            report(f"{name} flydsl vs ref", o_fly, ref)
-        report(f"{name} flydsl vs asm", o_fly, o_asm)
-        if a.mode == "bench":
+        k = c["topk"]
+        variants = [
+            parse_variant(v, k)
+            for v in (a.variants or [f"{a.ws}:{'k' if a.stored == 'k' else a.stored}"])
+        ]
+        for ws, st in variants:
+            o_fly = run_flydsl(
+                c, srt_f, a.tile_n, a.slices, tr, ws, st, a.admit
+            ).clone()
+            tag = f"flydsl ws{ws} stored{st}"
+            if ref is not None:
+                report(f"{name} {tag} vs ref", o_fly, ref)
+            report(f"{name} {tag} vs asm", o_fly, o_asm)
+        if a.mode == "bench" and a.variants:
+            fns = [lambda c=c, srt=srt: run_asm(c, srt)] + [
+                lambda c=c, srt=srt_f, tr=tr, ws=ws, st=st: run_flydsl(
+                    c, srt, a.tile_n, a.slices, tr, ws, st, a.admit, not a.no_reduce
+                )
+                for ws, st in variants
+            ]
+            t = time_pair(fns, rounds=a.rounds)
+            med = [sorted(x)[len(x) // 2] for x in t]
+            line = f"[bench] {name} {shape}: asm {med[0]:.1f}"
+            for (ws, st), tv, m in zip(variants, t[1:], med[1:]):
+                ratios = sorted(f / s for f, s in zip(tv, t[0]))
+                line += (
+                    f" | ws{ws}:s{st} {m:.1f} "
+                    f"({100 * (ratios[len(ratios) // 2] - 1):+.1f}%)"
+                )
+            print(line + (" [kernel only]" if a.no_reduce else ""))
+        elif a.mode == "bench":
+            ws, st = variants[0]
             t = time_pair(
                 [
                     lambda c=c, srt=srt: run_asm(c, srt),
-                    lambda c=c, srt=srt_f, tr=tr: run_flydsl(
-                        c, srt, a.tile_n, a.slices, tr
+                    lambda c=c, srt=srt_f, tr=tr, ws=ws, st=st: run_flydsl(
+                        c, srt, a.tile_n, a.slices, tr, ws, st, a.admit, not a.no_reduce
                     ),
                 ],
                 rounds=a.rounds,
