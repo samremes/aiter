@@ -120,7 +120,12 @@ class Geometry:
         self.off_xs = self.off_amax + 4 * (cols // BLK) * rows * 4
         end = self.off_xs + 2 * 2 * rows * 4
         self.off_stage = -(-max(end, 2 * self.relay) // 1024) * 1024
-        self.lds = self.off_stage + slices * (cols // BLK) * self.h_block
+        # At 128 rows the down scales of all but the last slice, f32
+        # [slice][block][token], park here through the later slices' gate/up,
+        # whose accumulators leave no registers for them.
+        self.park = rows > 64
+        self.off_act = self.off_stage + slices * (cols // BLK) * self.h_block
+        self.lds = self.off_act + self.park * (slices - 1) * (cols // BLK) * rows * 4
 
 
 def lds_bytes(rows, cols, slices):
@@ -178,6 +183,8 @@ def launch_fmoe_blockscale(
     OFF_AMAX = geo.off_amax
     OFF_XS = geo.off_xs
     OFF_STAGE = geo.off_stage
+    OFF_ACT = geo.off_act
+    park = geo.park
     ARENA = geo.lds
     ps_deno = I // (cols * slices)  # column tiles per row block
     assert grid % 16 == 0 and grid % ps_deno == 0
@@ -367,6 +374,12 @@ def launch_fmoe_blockscale(
         amax_r = opaque(OFF_AMAX // 4 + lane16)
         relay_w = opaque(lane16 * RELAY_PITCH + wave * 16 + kgrp * 4)
         xs_r = OFF_XS // 4 + lane16
+
+        act_r = opaque(OFF_ACT // 4 + lane16)
+
+        def act_off(sl, b, gi):
+            return act_r + (sl * n_blk + b) * ROWS + gi * 16
+
         relay_r = opaque(wave * (rows_w * RELAY_PITCH // 2) + lane)
 
         mma = fx.make_mma_atom(
@@ -784,9 +797,12 @@ def launch_fmoe_blockscale(
                         q = fx.Float32(FP8_MAX) * Float32(
                             rocdl.rcp(T.f32, Float32(m).ir_value())
                         )
-                        act_s[sl][gi][b] = (
-                            Float32(m) * fx.Float32(1.0 / FP8_MAX) * rw_b[gi]
-                        )
+                        a = Float32(m) * fx.Float32(1.0 / FP8_MAX) * rw_b[gi]
+                        if const_expr(sl + 1 < slices and park):
+                            # Every lane of the token stores the same value.
+                            fx.ptr_store(a, fx.add_offset(lds_f32, act_off(sl, b, gi)))
+                        else:
+                            act_s[sl][gi][b] = a
                         for j in range_constexpr(2 * b, 2 * b + 2):
                             v = [
                                 (h[j][gi][r] * q).ir_value() for r in range_constexpr(4)
@@ -799,6 +815,12 @@ def launch_fmoe_blockscale(
                             off = st_w[j % 2] + (sl * h_panel + stack_off(b, gi)) // 4
                             fx.ptr_store(Int32(pk), fx.add_offset(lds_i32, off))
             gpu.barrier()
+            for sl in range_constexpr(slices - 1 if park else 0):
+                for gi in range_constexpr(n_groups):
+                    for b in range_constexpr(n_blk):
+                        act_s[sl][gi][b] = fx.ptr_load(
+                            fx.add_offset(lds_f32, act_off(sl, b, gi))
+                        )
 
             # Admission: wait (bounded) while down_limit workgroups are in down.
             if tid == 0:
