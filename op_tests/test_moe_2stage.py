@@ -6,7 +6,10 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import ExitStack, nullcontext
+import re
+import sys
+import tempfile
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import pandas as pd
 import torch
@@ -759,6 +762,12 @@ parser.add_argument(
     "--bm16-scale-boundary",
     action="store_true",
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
+)
+parser.add_argument(
+    "--fmoe-blockscale-flydsl",
+    action="store_true",
+    help="Run only the FlyDSL blockscale-fp8 fused-MoE dispatch and accuracy "
+    "tests (gfx950), forced through a temporary tuned-config table.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1711,6 +1720,223 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+# FlyDSL fused blockscale-fp8 MoE (gfx950): no shipped CSV names it, so these
+# tests point AITER_CONFIG_FMOE at a temporary table holding only their rows.
+# (token, model_dim, inter_dim, E, topk, kernelName1): the default (ws 2 at
+# 7168 x 256 from 2048 tokens), one to three 256-column slices, 384 columns,
+# odd token counts and the 128-row tile.
+_FMOE_BLOCKSCALE_CASES = (
+    (2048, 7168, 256, 257, 9, "flydsl_fmoe_blockscale"),
+    (2048, 7168, 256, 257, 9, "flydsl_fmoe_blockscale_r64_c256_s1_ws0"),
+    (333, 4096, 512, 64, 6, "flydsl_fmoe_blockscale_r64_c256_s2"),
+    (97, 2048, 768, 32, 4, "flydsl_fmoe_blockscale_r64_c256_s3"),
+    (257, 7168, 384, 64, 8, "flydsl_fmoe_blockscale_r64_c384"),
+    (515, 4096, 512, 64, 6, "flydsl_fmoe_blockscale_r128_c256"),
+)
+
+
+def _fmoe_blockscale_available():
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip FlyDSL blockscale fused-MoE tests on %s", get_gfx())
+        return False
+    try:
+        import flydsl  # noqa: F401
+    except ImportError:
+        aiter.logger.info("skip FlyDSL blockscale fused-MoE tests: no flydsl")
+        return False
+    return True
+
+
+def _fmoe_blockscale_row(token, model_dim, inter_dim, E, topk, kernel_name, **kw):
+    """A per_1x128 fp8 Silu g1u1 run_1stage tuned row naming ``kernel_name``."""
+    rows = re.search(r"_r(\d+)", kernel_name)
+    row = {
+        "gfx": get_gfx(),
+        "cu_num": get_cu_num(),
+        "token": get_padded_M(token),
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "expert": E,
+        "topk": topk,
+        "act_type": str(aiter.ActivationType.Silu),
+        "dtype": str(torch.bfloat16),
+        "q_dtype_a": str(dtypes.fp8),
+        "q_dtype_w": str(dtypes.fp8),
+        "q_type": str(aiter.QuantType.per_1x128),
+        "use_g1u1": 1,
+        "doweight_stage1": 0,
+        "block_m": int(rows.group(1)) if rows else 64,
+        "ksplit": 0,
+        "us1": 0.0,
+        "kernelName1": kernel_name,
+        "err1": "0.0%",
+        "us2": 0.0,
+        "kernelName2": "Null",
+        "err2": "0.0%",
+        "us": 0.0,
+        "run_1stage": 1,
+        "tflops": 0.0,
+        "bw": 0.0,
+        "_tag": "",
+    }
+    row.update(kw)
+    return row
+
+
+@contextmanager
+def _fmoe_tuned_rows(rows):
+    """Make ``rows`` the whole fused-MoE tuned table, then restore the old one.
+
+    The resolved config path (lru_cached, not keyed on the environment), the
+    parsed table and the per-shape lookups are all cached, so each is reset.
+    """
+    fused_moe_mod = sys.modules["aiter.fused_moe"]
+    saved = fused_moe_mod.cfg_2stages
+    clear_config_paths = type(AITER_CONFIGS).get_config_file.cache_clear
+
+    def reset(cfg_2stages):
+        fused_moe_mod.cfg_2stages = cfg_2stages
+        clear_config_paths()
+        get_2stage_cfgs.cache_clear()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "tuned_fmoe.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        try:
+            with override_env("AITER_CONFIG_FMOE", path):
+                reset(None)
+                yield
+        finally:
+            reset(saved)
+
+
+@contextmanager
+def _count_fmoe_blockscale_launches():
+    """Count calls to the FlyDSL blockscale wrapper, which fused_moe_1stage
+    imports at call time."""
+    from aiter.ops.flydsl import fmoe_blockscale
+
+    launch = fmoe_blockscale.fmoe_blockscale_g1u1_flydsl
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs)
+        return launch(*args, **kwargs)
+
+    fmoe_blockscale.fmoe_blockscale_g1u1_flydsl = counted
+    try:
+        yield calls
+    finally:
+        fmoe_blockscale.fmoe_blockscale_g1u1_flydsl = launch
+
+
+def _fmoe_blockscale_cfgs(token, model_dim, inter_dim, E, topk, act):
+    return get_2stage_cfgs(
+        get_padded_M(token),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp8,
+        aiter.QuantType.per_1x128,
+        True,
+        act,
+        False,
+        0,
+        0,
+        True,
+        GateMode.SEPARATED.value,
+        opus_weights_shuffled=True,
+        input_dtype=torch.bfloat16,
+    )
+
+
+def test_fmoe_blockscale_flydsl_dispatch():
+    """A tuned run_1stage row naming the FlyDSL blockscale kernel dispatches it;
+    rows it cannot run fall back to the default heuristics."""
+    if not _fmoe_blockscale_available():
+        return
+    shape = (2048, 7168, 256, 257, 9)
+    name = "flydsl_fmoe_blockscale_r64_c256_s1_ws0"
+    with _fmoe_tuned_rows([_fmoe_blockscale_row(*shape, name)]):
+        metadata = _fmoe_blockscale_cfgs(*shape, aiter.ActivationType.Silu)
+    assert metadata.run_1stage and metadata.stage2 is None
+    assert metadata.block_m == 64
+    assert metadata.stage1.keywords["kernelName"] == name
+
+    rejected = (
+        # No such tile, a block_m the tile rows disagree with, slices that do
+        # not divide inter_dim, ping-pong off 64 x 256, and a malformed name.
+        (shape, "flydsl_fmoe_blockscale_r64_c512", {}),
+        (shape, name, {"block_m": 32}),
+        ((2048, 7168, 768, 257, 9), "flydsl_fmoe_blockscale_c256_s2", {}),
+        ((2048, 7168, 384, 257, 9), "flydsl_fmoe_blockscale_c384_ws2", {}),
+        (shape, "flydsl_fmoe_blockscale_ws0_s1", {}),
+    )
+    for row_shape, row_name, kw in rejected:
+        with _fmoe_tuned_rows([_fmoe_blockscale_row(*row_shape, row_name, **kw)]):
+            metadata = _fmoe_blockscale_cfgs(*row_shape, aiter.ActivationType.Silu)
+        kernel = getattr(metadata.stage1, "keywords", {}).get("kernelName")
+        assert not str(kernel).startswith("flydsl_fmoe_blockscale"), (row_name, kw)
+    # Gelu: the kernel only fuses Silu.
+    with _fmoe_tuned_rows(
+        [_fmoe_blockscale_row(*shape, name, act_type=str(aiter.ActivationType.Gelu))]
+    ):
+        metadata = _fmoe_blockscale_cfgs(*shape, aiter.ActivationType.Gelu)
+    kernel = getattr(metadata.stage1, "keywords", {}).get("kernelName")
+    assert not str(kernel).startswith("flydsl_fmoe_blockscale"), kernel
+    aiter.logger.info("moe_2stage: FlyDSL blockscale dispatch test passed")
+
+
+def test_fmoe_blockscale_flydsl(cases=_FMOE_BLOCKSCALE_CASES):
+    """Run fused_moe per_128x128 fp8 cases forced onto the FlyDSL kernel."""
+    if not _fmoe_blockscale_available():
+        return []
+    results = []
+    for token, model_dim, inter_dim, E, topk, name in cases:
+        torch.manual_seed(0)
+        row = _fmoe_blockscale_row(token, model_dim, inter_dim, E, topk, name)
+        with _fmoe_tuned_rows([row]), _count_fmoe_blockscale_launches() as calls:
+            ret = test_fmoe(
+                dtype=torch.bfloat16,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=E,
+                topk=topk,
+                actType=aiter.ActivationType.Silu,
+                gateMode=GateMode.SEPARATED.value,
+                qType=aiter.QuantType.per_128x128,
+                AQDType=dtypes.fp8,
+                WQDType=dtypes.fp8,
+                use_g1u1=True,
+                strict_accuracy=True,
+                check_aot_cache=False,
+            )
+        assert calls, f"{name}: fused_moe did not launch the FlyDSL kernel"
+        results.append(
+            {
+                "token": token,
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "E": E,
+                "topk": topk,
+                "kernelName1": name,
+                "us": ret["us"],
+                "logits_diff": ret["logits_diff"],
+            }
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+    aiter.logger.info(
+        "moe_2stage: FlyDSL blockscale fused-MoE cases passed:\n%s",
+        pd.DataFrame(results).to_markdown(index=False),
+    )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1726,10 +1952,16 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
+elif args.fmoe_blockscale_flydsl:
+    test_fmoe_blockscale_flydsl_dispatch()
+    test_fmoe_blockscale_flydsl()
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_fmoe_blockscale_flydsl_dispatch()
+    if not args.no_flydsl_csv and args.quant is None:
+        test_fmoe_blockscale_flydsl()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(

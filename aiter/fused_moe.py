@@ -40,6 +40,10 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.fmoe_blockscale_kname import (
+    is_fmoe_blockscale_kname,
+    parse_fmoe_blockscale_kname,
+)
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -2210,6 +2214,33 @@ def fused_moe_1stage(
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
 
+        if quant_type == QuantType.per_1x128 and is_fmoe_blockscale_kname(kernelName):
+            # get_2stage_cfgs admitted this row (_fmoe_blockscale_reject_reason);
+            # moe_sorting zeroed moe_buf, which the kernel accumulates into.
+            from aiter.ops.flydsl.fmoe_blockscale import fmoe_blockscale_g1u1_flydsl
+
+            parsed = parse_fmoe_blockscale_kname(kernelName)
+            rows = parsed["rows"] or 64
+            assert block_size_M == rows, (block_size_M, kernelName)
+            fmoe_blockscale_g1u1_flydsl(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                tile_n=parsed["cols"],
+                slices=parsed["slices"],
+                rows=rows,
+                ws=parsed["ws"],
+                topk=topk,
+            )
+            return moe_buf
         if quant_type == QuantType.per_1x128:
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
@@ -2312,6 +2343,94 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+
+
+def _fmoe_blockscale_reject_reason(
+    kernel_name,
+    cfg,
+    *,
+    gfx,
+    token,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    doweight_stage1,
+    hidden_pad,
+    intermediate_pad,
+    is_shuffled,
+    gate_mode,
+    is_ep,
+    has_stage1_bias,
+    has_stage2_bias,
+    input_dtype,
+    has_stage2_scatter,
+    has_activation_scales,
+    has_num_local_tokens,
+):
+    """Why a tuned ``flydsl_fmoe_blockscale*`` row cannot run here, else None.
+
+    The FlyDSL kernel is the 1-stage fp8 blockscale (128x128 weights, 1x128
+    activations) g1u1 SiLU MoE with bf16 output on gfx950; ``fused_moe_1stage``
+    quantizes A with the transposed scale it reads and ``moe_sorting`` zeroes
+    the output it accumulates into, with block_m equal to the tile rows.
+    """
+    try:
+        parsed = parse_fmoe_blockscale_kname(kernel_name)
+    except ValueError as error:
+        return str(error)
+    rows = parsed["rows"] or 64
+    checks = (
+        (gfx != "gfx950", f"gfx {gfx}"),
+        (not cfg.get("run_1stage", False), "run_1stage=0"),
+        (q_type != QuantType.per_1x128, f"quant {q_type}"),
+        (
+            not (q_dtype_a == q_dtype_w == dtypes.fp8),
+            f"dtypes a={q_dtype_a} w={q_dtype_w}",
+        ),
+        (dtype != dtypes.bf16, f"output dtype {dtype}"),
+        (
+            input_dtype is not None and input_dtype != dtypes.bf16,
+            f"activation dtype {input_dtype}",
+        ),
+        (activation != ActivationType.Silu, f"activation {activation}"),
+        (not use_g1u1, "use_g1u1=False"),
+        (bool(doweight_stage1), "doweight_stage1=True"),
+        (bool(hidden_pad or intermediate_pad), "hidden/intermediate padding"),
+        (not is_shuffled, "weights not preshuffled"),
+        (gate_mode is not GateMode.SEPARATED, f"gate mode {gate_mode.value!r}"),
+        (is_ep, "expert_mask"),
+        (has_stage1_bias or has_stage2_bias, "per-expert bias"),
+        (has_stage2_scatter, "stage2_scatter"),
+        (has_activation_scales, "prequantized activations"),
+        (has_num_local_tokens, "num_local_tokens"),
+        (int(cfg.get("block_m", 0)) != rows, f"block_m != {rows} tile rows"),
+        (bool(int(cfg.get("xbf16", 0) or 0)), "xbf16"),
+        (bool(int(cfg.get("flat", 0) or 0)), "flat sort"),
+    )
+    for failed, reason in checks:
+        if failed:
+            return f"unsupported {reason}"
+    try:
+        from aiter.ops.flydsl.fmoe_blockscale import fmoe_config
+
+        fmoe_config(
+            token,
+            model_dim,
+            inter_dim,
+            parsed["cols"],
+            parsed["slices"],
+            rows,
+            parsed["ws"],
+        )
+    except (ImportError, ValueError) as error:
+        return str(error)
+    return None
+
 
 # Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
 # SiLU and GELU are the same length, so swapping the tag keeps the mangled
@@ -3905,6 +4024,40 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+
+    if cfg is not None and is_fmoe_blockscale_kname(kn1):
+        reject_reason = _fmoe_blockscale_reject_reason(
+            kn1,
+            cfg,
+            gfx=gfx,
+            token=token,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            q_type=q_type,
+            use_g1u1=use_g1u1,
+            activation=activation,
+            doweight_stage1=doweight_stage1,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            is_shuffled=bool(opus_weights_shuffled),
+            gate_mode=gate_mode,
+            is_ep=is_ep,
+            has_stage1_bias=has_stage1_bias,
+            has_stage2_bias=has_stage2_bias,
+            input_dtype=input_dtype,
+            has_stage2_scatter=has_stage2_scatter,
+            has_activation_scales=has_activation_scales,
+            has_num_local_tokens=has_num_local_tokens,
+        )
+        if reject_reason is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding FlyDSL blockscale config {kn1!r} for "
+                f"{keys}: {reject_reason}; using default heuristics"
+            )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
