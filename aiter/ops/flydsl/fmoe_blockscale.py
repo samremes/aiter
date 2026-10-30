@@ -68,6 +68,30 @@ def fmoe_slices(inter_dim: int, tile_n: int, rows: int = 64, ws: int = 0) -> int
     return 1
 
 
+def fmoe_config(
+    tokens: int,
+    model_dim: int,
+    inter_dim: int,
+    tile_n: int | None = None,
+    slices: int | None = None,
+    rows: int = 64,
+    ws: int | None = None,
+    stored: int = 0,
+) -> tuple[int, int, int]:
+    """``(tile_n, slices, ws)`` with each ``None`` set to its default; raises
+    ``ValueError`` where the kernel has no such configuration."""
+    if ws is None:
+        ws = fmoe_ws(tokens, model_dim, inter_dim, rows)
+    if tile_n is None:
+        tile_n = 256 if ws else fmoe_tile_n(inter_dim, rows)
+    if slices is None:
+        slices = (
+            inter_dim // tile_n if stored else fmoe_slices(inter_dim, tile_n, rows, ws)
+        )
+    check_config(model_dim, inter_dim, tile_n, slices, rows, ws, stored)
+    return tile_n, slices, ws
+
+
 def fmoe_grid(
     device: torch.device, inter_dim: int, tile_n: int, slices: int = 1
 ) -> int:
@@ -121,15 +145,9 @@ def fmoe_blockscale_g1u1_flydsl(
     """
     tokens, model_dim = a_q.shape
     experts, _, inter_dim = w2.shape
-    if ws is None:
-        ws = fmoe_ws(tokens, model_dim, inter_dim, rows)
-    if tile_n is None:
-        tile_n = 256 if ws else fmoe_tile_n(inter_dim, rows)
-    if slices is None:
-        slices = (
-            inter_dim // tile_n if stored else fmoe_slices(inter_dim, tile_n, rows, ws)
-        )
-    check_config(model_dim, inter_dim, tile_n, slices, rows, ws, stored)
+    tile_n, slices, ws = fmoe_config(
+        tokens, model_dim, inter_dim, tile_n, slices, rows, ws, stored
+    )
     if stored:
         assert topk is not None and 0 < stored <= topk, "stored needs topk"
         partial = _partial(
@@ -209,6 +227,7 @@ def _partial(device: torch.device, numel: int) -> Tensor:
 
 __all__ = [
     "fmoe_blockscale_g1u1_flydsl",
+    "fmoe_config",
     "fmoe_grid",
     "fmoe_reduce",
     "fmoe_slices",

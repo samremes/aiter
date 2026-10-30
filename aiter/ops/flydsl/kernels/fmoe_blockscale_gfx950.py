@@ -77,17 +77,17 @@ the folds of a slice's last step sink to the silu, and the products they
 consume spill (384 columns: ~400 VGPRs).
 
 Step wait. The token scales of a step ride in LDS with its token panel (one
-more DMA), so the only loads issued after a step's DMA are the next gate
-weights, and the step waits with an exact ``vmcnt(4 n_j)``. LLVM does not
-track the DMA: ``wait_asyncmark`` lowers to ``vmcnt(0)``, which also drained
-the gate weights every step (9% on D = 2048 prefill).
+more DMA), so the only loads issued after a step's DMA are the first phase's
+weights, and the step waits with an exact ``vmcnt`` (``4 n_j`` at 64 rows,
+``2 n_j`` with split K halves). LLVM does not track the DMA:
+``wait_asyncmark`` lowers to ``vmcnt(0)``, which also drains those weights
+every step (prefill +5.5%, tuned_2048 +5.0%; see ``wait_loads``).
 """
 
 import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import BFloat16, Constexpr, Float32, Int8, Int32, T
@@ -290,36 +290,109 @@ def launch_fmoe_blockscale(
 
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel_fmoe(
-        arg_o: fx.Int64,
-        arg_x: fx.Int64,
-        arg_gu: fx.Int64,
-        arg_dw: fx.Int64,
-        arg_ids: fx.Int64,
-        arg_rw: fx.Int64,
-        arg_eids: fx.Int64,
-        arg_nvalid: fx.Int64,
-        arg_xq: fx.Int64,
-        arg_gq: fx.Int64,
-        arg_dq: fx.Int64,
-        arg_sem: fx.Int64,
-        arg_p: fx.Int64,
+        arg_o: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_gu: fx.Pointer,
+        arg_dw: fx.Pointer,
+        arg_ids: fx.Pointer,
+        arg_rw: fx.Pointer,
+        arg_eids: fx.Pointer,
+        arg_nvalid: fx.Pointer,
+        arg_xq: fx.Pointer,
+        arg_gq: fx.Pointer,
+        arg_dq: fx.Pointer,
+        arg_sem: fx.Pointer,
+        arg_p: fx.Pointer,
         i32_tokens: fx.Int32,
         i32_experts: fx.Int32,
     ):
+        # Low-level escapes, each where no FlyDSL 0.4.0 construct does the job.
+        # The alternatives were measured against this kernel (paired medians;
+        # VGPRs spilled per config).
+
+        def uniform(v):
+            """``v`` (wave-uniform) in an SGPR. Values derived from the wave
+            index then stay scalar too, e.g. every LDS DMA destination (M0).
+            Without it: ws 2 spills 31 VGPRs, not 21."""
+            return rocdl.readfirstlane(T.i32, v)
+
+        def opaque(v):
+            """``v`` in a VGPR the optimizer can't see through: constants added
+            to it then fold into the 16-bit ds offset instead of each becoming a
+            hoisted address register. As a plain value: 384 columns and three
+            slices reach 512 VGPRs and spill 120 and 90; tuned_3072 +36%."""
+            return Int32(
+                llvm.inline_asm(
+                    T.i32, [Int32(v).ir_value()], "v_mov_b32 $0, $1", "=v,v"
+                )
+            )
+
+        def settle(v):
+            """``v`` computed here: a side-effecting no-op on it keeps the
+            scheduler from sinking its producer down to the first real use.
+            Without it: ws 2 spills 177 VGPRs, 384 columns 309; tuned_3072
+            +26%, tuned_7168 +32%."""
+            x = v.ir_value()
+            return Vec(
+                llvm.inline_asm(x.type, [x], "", "=v,0", has_side_effects=True),
+                dtype=Float32,
+            )
+
+        def fence():
+            """A scheduling fence: no instruction moves across it (the call
+            sites say what it keeps apart and what dropping it costs)."""
+            rocdl.sched_barrier(0)
+
+        def wait_loads(n):
+            """Wait until at most ``n`` vector-memory loads are in flight; they
+            complete in issue order. LLVM does not track the LDS DMA, so the
+            async-copy wait lowers to ``vmcnt(0)``; that here: prefill +5.5%,
+            tuned_2048 +5.0%, tuned_3072 +4.0%, wide +3.6%."""
+            rocdl.s_waitcnt(vmcnt=n)
+
+        def barrier():
+            """``gpu.barrier`` that is never merged into an adjacent one (the
+            canonicalizer drops back-to-back barriers): under ``ws`` 2 each
+            role counts the other's barriers one for one. ``wave_barrier``
+            emits nothing; ``rocdl.barrier`` instead unrolls the ``idle`` loop
+            (128 s_barrier, not 16, and more scratch traffic)."""
+            rocdl.wave_barrier()
+            gpu.barrier()
+
+        def pack_fp8(v):
+            """Four f32 as e4m3 bytes in one i32. ``Vec.to(Float8E4M3FN)``
+            (``arith.truncf``) does not translate to LLVM IR in FlyDSL 0.4.0."""
+            pk = rocdl.cvt_pk_fp8_f32(T.i32, v[0], v[1], 0, 0)
+            return Int32(rocdl.cvt_pk_fp8_f32(T.i32, v[2], v[3], pk, 1))
+
+        def now():
+            """The 100 MHz constant clock (no FlyDSL clock op)."""
+            return fx.Int64(
+                llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
+            )
+
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
-        wave_g = rocdl.readfirstlane(T.i32, tid // WAVE)
+        wave_g = uniform(tid // WAVE)
         # The wave's index in its role (under ws 2 waves 4-7 run down).
         wave = wave_g % 4 if const_expr(pp) else wave_g
         lane = tid % WAVE
         lane16 = lane % 16
         kgrp = lane // 16
 
-        def _buffer(base, elem, align, nbytes):
-            ptr_ty = fx.PointerType.get(
-                elem, address_space=fx.AddressSpace.Global, alignment=align
+        def _global(ptr, elem, align):
+            """``ptr`` (the wrapper passes byte pointers) as ``elem``,
+            ``align``-byte aligned."""
+            return fx.recast_iter(
+                fx.PointerType.get(
+                    elem, address_space=fx.AddressSpace.Global, alignment=align
+                ),
+                ptr,
             )
-            view = fx.make_view(fx.inttoptr(ptr_ty, base), fx.make_layout(1 << 30, 1))
+
+        def _buffer(ptr, elem, align, nbytes):
+            """``ptr`` as a buffer tensor of ``nbytes``, indexed by element."""
+            view = fx.make_view(_global(ptr, elem, align), fx.make_layout(1 << 30, 1))
             buf = fx.rocdl.make_buffer_tensor(
                 fx.Tensor(view), max_size=False, num_records_bytes=nbytes
             )
@@ -341,6 +414,28 @@ def launch_fmoe_blockscale(
         p_bytes = tokens64 * (max(stored, 1) * D * 2)
         p_dst = _buffer(arg_p, T.bf16, 4, p_bytes)
         p_i32 = _buffer(arg_p, T.i32, 16, p_bytes)
+
+        def at(layout, *crd):
+            """Offset of ``crd`` in ``layout``: a Python int when static."""
+            return fx.get_scalar(fx.crd2idx(crd, layout))
+
+        # The global operands' layouts, in the units of their accesses. Block
+        # scales (f32): gate/up (expert, up, I block, D block), down (expert,
+        # D block, I block). Weights (i32), per expert matrix: (16-row group,
+        # 64-K plane, lane), a 16-byte chunk a lane. Only the lane term of a
+        # weight load is per lane; the rest rides in soffset.
+        gq_l = fx.make_ordered_layout((i32_experts, 2, ki, kd), (3, 2, 1, 0))
+        dq_l = fx.make_ordered_layout((i32_experts, kd, ki), (2, 1, 0))
+        gu_l = fx.make_layout((2 * I // 16, D // 64, WAVE), (4 * D, 256, 4))
+        dw_l = fx.make_layout((D // 16, I // 64, WAVE), (4 * I, 256, 4))
+        # Tokens: x (token, byte), its scales xq (token, D block), the output
+        # O (token, column) and the partials P (token, slot, column) in bf16
+        # and i32.
+        x_l = fx.make_ordered_layout((i32_tokens, D), (1, 0))
+        xq_l = fx.make_layout((i32_tokens, kd), (1, i32_tokens))
+        o_l = fx.make_ordered_layout((i32_tokens, D), (1, 0))
+        p_l = fx.make_ordered_layout((i32_tokens, max(stored, 1), D), (2, 1, 0))
+        p_l32 = fx.recast_layout(p_l, 16, 32)
 
         def sload(src, idx):
             return rocdl.s_buffer_load(fx.get_iter(src), idx)
@@ -386,10 +481,32 @@ def launch_fmoe_blockscale(
         )
 
         def panel_off(t, byte):
-            return fx.get_scalar(fx.crd2idx((t, byte), panel_swz))
+            return at(panel_swz, t, byte)
 
-        def stack_off(kh, gi):
-            return kh * H_BLOCK + gi * 2048
+        # The arena's regions (see Geometry) as layouts, in the units of
+        # their accesses. Token panels (bytes): (group, K half, buffer) in
+        # 2 KiB groups; h panels: (group, 128-K block, slice, h buffer).
+        tok_l = fx.make_layout((n_groups, 2, 2), (2048, H_BLOCK, PANEL))
+        tok_l32 = fx.recast_layout(tok_l, 8, 32)
+        h_l32 = fx.recast_layout(
+            fx.make_layout(
+                (n_groups, n_blk, slices, geo.nh),
+                (2048, H_BLOCK, h_panel, geo.h_bytes),
+            ),
+            8,
+            32,
+        )
+        # f32 scratch: amax (token, block, wave), token scales (token,
+        # K half, buffer), parked down scales (token, block, slice, h buffer).
+        amax_l = fx.make_layout((ROWS, n_blk, 4), (1, ROWS, n_blk * ROWS))
+        xs_l = fx.make_layout((ROWS, 2, 2), (1, ROWS, 2 * ROWS))
+        act_l = fx.make_layout(
+            (ROWS, n_blk, max(n_park, 1), geo.nh),
+            (1, ROWS, n_blk * ROWS, geo.act_bytes // 4),
+        )
+        # Relay (bf16): (row, column, slot), rows padded to RELAY_PITCH.
+        relay_l = fx.make_layout((ROWS, TURN_N, 2), (RELAY_PITCH, 1, RELAY // 2))
+        relay_l32 = fx.recast_layout(relay_l, 16, 32)
 
         # B reads: token lane16, 16-byte chunks kgrp and 4 + kgrp (the f8f6f4
         # operand pairs halves 64 K apart).
@@ -418,40 +535,18 @@ def launch_fmoe_blockscale(
                 )
             )
 
-        def opaque(v):
-            """``v`` in a VGPR the optimizer can't see through: constants added
-            to it then fold into the 16-bit ds offset instead of each becoming a
-            hoisted address register."""
-            return Int32(
-                llvm.inline_asm(
-                    T.i32, [Int32(v).ir_value()], "v_mov_b32 $0, $1", "=v,v"
-                )
-            )
-
-        def settle(v):
-            """``v`` computed here: a side-effecting no-op on it keeps the
-            scheduler from sinking its producer down to the first real use."""
-            x = v.ir_value()
-            return Vec(
-                llvm.inline_asm(x.type, [x], "", "=v,0", has_side_effects=True),
-                dtype=Float32,
-            )
-
         def h_bases(hb):
             """Per-lane bases of h buffer ``hb`` (0 but under ws 2), past
             64 KiB: the h panels' B reads and the requant's writes (column
             half c of a 128-K block), and the parked down scales."""
-            hp = hb * (geo.h_bytes // 4)  # i32
-            st_lo = opaque(OFF_STAGE // 4 + hp + b_lo)
-            st_hi = opaque(OFF_STAGE // 4 + hp + b_hi)
+            hp = OFF_STAGE // 4 + at(h_l32, 0, 0, 0, hb)
+            st_lo = opaque(hp + b_lo)
+            st_hi = opaque(hp + b_hi)
             st_w = [
-                opaque(
-                    (OFF_STAGE + panel_off(lane16, c * 64 + wave * 16 + kgrp * 4)) // 4
-                    + hp
-                )
+                opaque(hp + panel_off(lane16, c * 64 + wave * 16 + kgrp * 4) // 4)
                 for c in range_constexpr(2)
             ]
-            act_r = opaque(OFF_ACT // 4 + hb * (geo.act_bytes // 4) + lane16)
+            act_r = opaque(OFF_ACT // 4 + at(act_l, lane16, 0, 0, hb))
             return st_lo, st_hi, st_w, act_r
 
         if const_expr(not pp):
@@ -459,23 +554,20 @@ def launch_fmoe_blockscale(
         # Likewise the amax scratch (written by lanes < 16 of each wave, read
         # by token lane16) and the relay (written by C lanes, read by the
         # merge as two dwords a lane per row), in their element units.
-        amax_w = opaque(OFF_AMAX // 4 + wave * (n_blk * ROWS) + lane16)
+        amax_w = opaque(OFF_AMAX // 4 + at(amax_l, lane16, 0, wave))
         amax_r = opaque(OFF_AMAX // 4 + lane16)
-        relay_w = opaque(OFF_RELAY // 2 + lane16 * RELAY_PITCH + wave * 16 + kgrp * 4)
+        relay_w = opaque(OFF_RELAY // 2 + at(relay_l, lane16, wave * 16 + kgrp * 4, 0))
         xs_r = OFF_XS // 4 + lane16
 
         def act_off(act_r, sl, b, gi):
-            return act_r + (sl * n_blk + b) * ROWS + gi * 16
+            return act_r + at(act_l, gi * 16, b, sl, 0)
 
-        relay_r = opaque(OFF_RELAY // 4 + wave * (rows_w * RELAY_PITCH // 2) + lane)
+        relay_r = opaque(OFF_RELAY // 4 + at(relay_l32, wave * rows_w, lane, 0))
         # Wide partial stores: 16 bytes a lane, lpr lanes a relay row, so one
         # store covers rpi whole rows (row lane_row of the instruction).
         lane_row = lane // lpr
         relay_r4 = opaque(
-            OFF_RELAY // 4
-            + wave * (rows_w * RELAY_PITCH // 2)
-            + lane_row * (RELAY_PITCH // 2)
-            + lane % lpr * 4
+            OFF_RELAY // 4 + at(relay_l32, wave * rows_w + lane_row, lane % lpr * 4, 0)
         )
 
         mma = fx.make_mma_atom(
@@ -556,48 +648,18 @@ def launch_fmoe_blockscale(
         tail = slot % 2 * (grid // 2) + xcd * (grid // 16) + slot // 2
         n_tiles = full + (tail < n_work - full * grid).select(fx.Int32(1), fx.Int32(0))
 
-        def now():
-            """The 100 MHz constant clock, low word."""
-            return Int32(
-                llvm.inline_asm(
-                    T.i32,
-                    [],
-                    "s_memrealtime s[0:1]\ns_waitcnt lgkmcnt(0)\ns_mov_b32 $0, s0",
-                    "=s,~{s0},~{s1}",
-                    has_side_effects=True,
-                )
-            )
-
         # Down admission: a device-wide count of workgroups in their down phase.
-        sem = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), arg_sem.ir_value())
+        sem = _global(arg_sem, T.i32, 4)
 
         def sem_add(v):
-            llvm.atomicrmw(
-                llvm.AtomicBinOp.add,
-                sem,
-                fx.Int32(v).ir_value(),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            )
+            fx.atomic_add(sem, Int32(v), syncscope=rocdl.SyncScope.Agent)
 
         def sem_load():
-            return Int32(
-                llvm.load(
-                    T.i32,
-                    sem,
-                    ordering=llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                )
+            return fx.generic_load(
+                sem,
+                memory_order=fx.AtomicOrdering.Monotonic,
+                syncscope=rocdl.SyncScope.Agent,
             )
-
-        def barrier():
-            """``gpu.barrier`` that is never merged into an adjacent one (the
-            canonicalizer drops back-to-back barriers): under ``ws`` 2 each
-            role counts the other's barriers one for one."""
-            llvm.inline_asm(None, [], "", "", has_side_effects=True)
-            gpu.barrier()
 
         def step_barrier():
             """The gate/up step, amax, down turn and handoff barrier:
@@ -624,6 +686,18 @@ def launch_fmoe_blockscale(
             out_slot = [v >> 24 for v in out_id]
             n_runs = rows_w * pieces
 
+            def relay_pair(slot, r, d):
+                """Relay row ``r`` of the wave, 128-column run ``d``: a dword
+                (two bf16 columns) a lane."""
+                pair = fx.ptr_load(
+                    fx.add_offset(lds_i32, relay_r + at(relay_l32, r, d * 64, slot))
+                )
+                frag = fx.make_rmem_tensor(2, BFloat16)
+                frag.store(
+                    Vec.from_elements([Int32(pair)], dtype=Int32).bitcast(BFloat16)
+                )
+                return frag
+
             def merge(turn, slot, part, n_part):
                 """Adds part ``part`` of ``n_part`` of the wave's relay rows into O:
                 a dword a 128-column run a lane, each atomic one contiguous
@@ -644,33 +718,16 @@ def launch_fmoe_blockscale(
                 sel = list(range(n_runs))[
                     part * n_runs // n_part : (part + 1) * n_runs // n_part
                 ]
-                pairs = [
-                    fx.ptr_load(
-                        fx.add_offset(
-                            lds_i32,
-                            relay_r
-                            + (
-                                slot * RELAY // 4
-                                + i // pieces * (RELAY_PITCH // 2)
-                                + i % pieces * 64
-                            ),
-                        )
-                    )
-                    for i in sel
-                ]
+                frags = [relay_pair(slot, i // pieces, i % pieces) for i in sel]
                 # The turn offset rides in soffset; the token row stays in
                 # voffset, the only part the range check sees.
-                atom = atomic_bf16x2.set_value("soffset", turn * TURN_N)
-                for i, pair in zip(sel, pairs):
+                atom = atomic_bf16x2.set_value("soffset", at(o_l, 0, turn * TURN_N))
+                for i, frag in zip(sel, frags):
                     col = (i % pieces) * 128 + lane * 2
-                    frag = fx.make_rmem_tensor(2, BFloat16)
-                    frag.store(
-                        Vec.from_elements([Int32(pair)], dtype=Int32).bitcast(BFloat16)
-                    )
                     fx.copy(
                         atom,
                         frag,
-                        fx.slice(o_dst, (None, out_tok[i // pieces] * D + col)),
+                        fx.slice(o_dst, (None, at(o_l, out_tok[i // pieces], col))),
                     )
 
             def read_quad(slot, q):
@@ -681,8 +738,7 @@ def launch_fmoe_blockscale(
                     fx.make_view(
                         fx.add_offset(
                             lds_i32,
-                            relay_r4
-                            + (slot * RELAY // 4 + q * rpi * (RELAY_PITCH // 2)),
+                            relay_r4 + at(relay_l32, q * rpi, 0, slot),
                         ),
                         fx.make_layout(4, 1),
                     ),
@@ -697,10 +753,10 @@ def launch_fmoe_blockscale(
                 for j in range_constexpr(1, rpi):
                     tok = (lane_row == j).select(out_tok[q * rpi + j], tok)
                     ps = (lane_row == j).select(out_slot[q * rpi + j], ps)
-                st = store_x4.set_value("soffset", turn * (TURN_N // 2))
-                p_at = fx.slice(
-                    p_i32, (None, (tok * stored + ps) * (D // 2) + lane % lpr * 4)
+                st = store_x4.set_value(
+                    "soffset", at(p_l32, 0, 0, turn * (TURN_N // 2))
                 )
+                p_at = fx.slice(p_i32, (None, at(p_l32, tok, ps, lane % lpr * 4)))
                 fx.copy(st, frag, p_at)
 
             def all_stored(rows):
@@ -733,24 +789,14 @@ def launch_fmoe_blockscale(
                     merge_rows(turn, slot, rows)
 
             def merge_rows(turn, slot, rows):
-                atom = atomic_bf16x2.set_value("soffset", turn * TURN_N)
+                atom = atomic_bf16x2.set_value("soffset", at(o_l, 0, turn * TURN_N))
                 for r in rows:
                     ps = out_slot[r]
-                    st = store_bf16x2.set_value("soffset", ps * D + turn * TURN_N)
+                    st = store_bf16x2.set_value(
+                        "soffset", at(p_l, 0, ps, turn * TURN_N)
+                    )
                     for d in range_constexpr(pieces):
-                        pair = fx.ptr_load(
-                            fx.add_offset(
-                                lds_i32,
-                                relay_r
-                                + (slot * RELAY // 4 + r * (RELAY_PITCH // 2) + d * 64),
-                            )
-                        )
-                        frag = fx.make_rmem_tensor(2, BFloat16)
-                        frag.store(
-                            Vec.from_elements([Int32(pair)], dtype=Int32).bitcast(
-                                BFloat16
-                            )
-                        )
+                        frag = relay_pair(slot, r, d)
                         col = d * 128 + lane * 2
                         # Slots below ``stored`` store into their P plane, the
                         # rest add into O (a wave-uniform branch).
@@ -758,15 +804,13 @@ def launch_fmoe_blockscale(
                             fx.copy(
                                 st,
                                 frag,
-                                fx.slice(
-                                    p_dst, (None, out_tok[r] * (stored * D) + col)
-                                ),
+                                fx.slice(p_dst, (None, at(p_l, out_tok[r], 0, col))),
                             )
                         else:
                             fx.copy(
                                 atom,
                                 frag,
-                                fx.slice(o_dst, (None, out_tok[r] * D + col)),
+                                fx.slice(o_dst, (None, at(o_l, out_tok[r], col))),
                             )
 
             return merge
@@ -776,9 +820,15 @@ def launch_fmoe_blockscale(
             ``hb``, then down and the output (``dn``); ws 2 splits the roles."""
             row0 = eb * ROWS
             expert = sload(eids_src, eb)
+            # Buffer offsets are 32 bits and the weights of all experts can
+            # pass 4 GiB, so the expert moves the 64-bit base instead.
             e64 = fx.Int64(expert)
-            gu_w = _buffer(arg_gu + e64 * (2 * I * D), T.i32, 16, fx.Int64(2 * I * D))
-            dw_w = _buffer(arg_dw + e64 * (D * I), T.i32, 16, fx.Int64(D * I))
+            gu_w = _buffer(
+                fx.add_offset(arg_gu, e64 * (2 * I * D)), T.i32, 16, fx.Int64(2 * I * D)
+            )
+            dw_w = _buffer(
+                fx.add_offset(arg_dw, e64 * (D * I)), T.i32, 16, fx.Int64(D * I)
+            )
             if const_expr(pp):
                 st_lo, st_hi, st_w, act_r = h_bases(hb)
             else:
@@ -790,7 +840,7 @@ def launch_fmoe_blockscale(
                 for b in range_constexpr(2):
                     row = row0 + (wave + 4 * q) * 16 + b * 8 + lane // 8
                     tok = vload(load_i32, ids_src, row, Int32) & 0xFFFFFF
-                    dma_src.append(tok * D + dma_byte[b])
+                    dma_src.append(at(x_l, tok, dma_byte[b]))
             # The token-scale DMA: wave w moves half kh = w & 1 of rows
             # 64 xh + l, xh = (w >> 1) % (rows / 64) (at 64 rows waves 2, 3
             # repeat 0, 1). The padding token clamps to a real one: its
@@ -809,54 +859,43 @@ def launch_fmoe_blockscale(
                 for kh in range_constexpr(2):
                     for q in range_constexpr(n_dma):
                         for b in range_constexpr(2):
-                            lds_off = (
-                                buf * PANEL
-                                + stack_off(kh, 0)
-                                + (wave + 4 * q) * 2048
-                                + b * 1024
-                            )
+                            # Token rows 8 b .. of group w + 4 q.
+                            lds_off = at(tok_l, wave + 4 * q, kh, buf) + b * 1024
                             dst = fx.make_view(
-                                fx.add_offset(
-                                    lds_i8, rocdl.readfirstlane(T.i32, lds_off)
-                                ),
+                                fx.add_offset(lds_i8, lds_off),
                                 fx.make_layout(1, 1),
                             )
                             fx.copy(
-                                dma16.set_value("soffset", (s * 2 + kh) * BLK),
+                                dma16.set_value(
+                                    "soffset", at(x_l, 0, (s * 2 + kh) * BLK)
+                                ),
                                 fx.slice(x_src, (None, dma_src[q * 2 + b])),
                                 dst,
                             )
                 xs_dst = fx.make_view(
                     fx.add_offset(
                         lds_f32,
-                        rocdl.readfirstlane(
-                            T.i32, OFF_XS // 4 + (buf * 2 + wave % 2) * ROWS + xh * 64
-                        ),
+                        OFF_XS // 4 + at(xs_l, xh * 64, wave % 2, buf),
                     ),
                     fx.make_layout(1, 1),
                 )
                 fx.copy(
-                    dma4.set_value("soffset", (s * 2 + wave % 2) * i32_tokens),
-                    fx.slice(xq_src, (None, tok_x)),
+                    dma4.set_value("soffset", at(xq_l, 0, s * 2 + wave % 2)),
+                    fx.slice(xq_src, (None, at(xq_l, tok_x, 0))),
                     xs_dst,
                 )
 
-            # Weight chunk of lane l: row group rg, 64-K plane p at
-            # rg * 16 * K + p * 1024 + 16 l (bytes) of the expert's matrix. All
-            # but the lane term is wave-uniform and rides in soffset, so every
-            # weight load shares the one lane VGPR.
-            lane_w = lane * 4  # i32
-
-            def load_weights(src, rg, k_rows, plane, frag):
+            def load_weights(src, w_l, rg, plane, frag):
+                """Lane chunks of planes ``plane`` and ``plane + 1`` (one 128-K
+                block) of row group ``rg``: every weight load shares the lane
+                VGPRs, the rest is wave-uniform (soffset)."""
                 if const_expr("compute" in KO):
                     return
-                atom = load_w.set_value(
-                    "soffset", rg * (16 * k_rows // 4) + plane * 256
-                )
+                atom = load_w.set_value("soffset", at(w_l, rg, plane, 0))
                 lo = fx.make_rmem_tensor(4, Int32)
                 hi = fx.make_rmem_tensor(4, Int32)
-                fx.copy(atom, fx.slice(src, (None, lane_w)), lo)
-                fx.copy(atom, fx.slice(src, (None, lane_w + 256)), hi)
+                fx.copy(atom, fx.slice(src, (None, at(w_l, 0, 0, lane))), lo)
+                fx.copy(atom, fx.slice(src, (None, at(w_l, 0, 1, lane))), hi)
                 frag.store(lo.load().shuffle(hi.load(), list(range(8))))
 
             def matrix_loads(w, s, phase, cs):
@@ -864,7 +903,7 @@ def launch_fmoe_blockscale(
 
                 def one(k, kh, j):
                     rg = cs * (cols // 16) + wave + 4 * j + (I // 16 if up else 0)
-                    return lambda: load_weights(gu_w, rg, D, s * 4 + kh * 2, w[k][j])
+                    return lambda: load_weights(gu_w, gu_l, rg, s * 4 + kh * 2, w[k][j])
 
                 return [
                     one(k, kh, j)
@@ -880,7 +919,7 @@ def launch_fmoe_blockscale(
                 def one(t, kb):
                     rg = turn * (TURN_N // 16) + 4 * t + wave
                     return lambda: load_weights(
-                        dw_w, rg, I, cs * (cols // 64) + kb * 2, w[t][kb]
+                        dw_w, dw_l, rg, cs * (cols // 64) + kb * 2, w[t][kb]
                     )
 
                 return [
@@ -898,7 +937,7 @@ def launch_fmoe_blockscale(
             # MFMAs only; the gate and up phases each read the panel once.
             def read_tok(buf, kh, gi):
                 frag = fx.make_rmem_tensor(8, Int32)
-                read_b(buf * (PANEL // 4) + stack_off(kh, gi) // 4, frag)
+                read_b(at(tok_l32, gi, kh, buf), frag)
                 return frag
 
             def fold(w, acc, ws, khs, xs, side, buf, b0, b_next):
@@ -941,21 +980,22 @@ def launch_fmoe_blockscale(
                 # Each phase's weights load during the phase before; the step's
                 # first, with the token scales, during the last of the previous.
                 # The DMA goes first: the step's wait then covers it alone.
+                # Unfenced, the weight loads issue first and the wait misses
+                # the DMA: wrong results in every config.
                 issue_tokens(0, 0)
-                rocdl.sched_barrier(0)
+                fence()
                 load_matrix(w_gu[0], 0, phases[0], cs)
 
             def gate_up_step(s, last, cs):
                 buf = s % 2
-                gq_row = expert * (2 * I // BLK) + cs * (cols // BLK)
                 ws = [
                     [
                         [
                             sload_f32(
                                 gq_src,
-                                (gq_row + up * (I // BLK) + b) * kd + s * 2 + kh,
+                                at(gq_l, expert, up, cs * n_blk + b, s * 2 + kh),
                             )
-                            for b in range_constexpr(cols // BLK)
+                            for b in range_constexpr(n_blk)
                         ]
                         for kh in range_constexpr(2)
                     ]
@@ -964,7 +1004,7 @@ def launch_fmoe_blockscale(
                 # vmcnt is in order: waiting for the step's token DMA means
                 # waiting until only the first phase's weight loads, issued
                 # after it, are in flight. Those stay in flight into its MFMAs.
-                rocdl.s_waitcnt(vmcnt=2 * len(phases[0][1]) * n_j)
+                wait_loads(2 * len(phases[0][1]) * n_j)
                 step_barrier()
                 b = read_tok(buf, phases[0][1][0], 0)
                 # Each phase loads the next one's weights; the next step's
@@ -985,7 +1025,7 @@ def launch_fmoe_blockscale(
                     fx.ptr_load(
                         fx.add_offset(
                             lds_f32,
-                            xs_r + (buf * 2 + kh) * ROWS + gi * 16,
+                            xs_r + at(xs_l, gi * 16, kh, buf),
                         )
                     )
                     for kh in range_constexpr(2)
@@ -999,7 +1039,9 @@ def launch_fmoe_blockscale(
                         b_next = lambda: None
                     if const_expr(pp and p > 0 and p % (len(phases) // pp_a) == 0):
                         barrier()  # ws 2: one down turn a len(phases) / pp_a phases
-                    rocdl.sched_barrier(0)
+                    # Each phase's fold stays in its phase. Unfenced: ws 2 spills
+                    # twice the VGPRs; tuned_7168 +1.8%, the others +0.2-0.5%.
+                    fence()
                     b = fold(
                         w_gu[p % 2],
                         acc_u if up else acc_g,
@@ -1040,21 +1082,18 @@ def launch_fmoe_blockscale(
                             vals = []
                             for r in range_constexpr(4):
                                 e = fx.exp2(g[r] * fx.Float32(-LOG2E), fastmath="afn")
-                                sig = Float32(
-                                    rocdl.rcp(T.f32, (fx.Float32(1.0) + e).ir_value())
-                                )
+                                with fx.arith.fastmath("afn"):
+                                    sig = fx.Float32(1.0) / (fx.Float32(1.0) + e)
                                 vals.append(g[r] * sig * u[r])
                             h[j][gi] = vals
                     # The next slice's first loads, or the first down weights, land
-                    # during the requant; issued only now, with h (half the
-                    # accumulators' registers) live, nothing spills.
-                    rocdl.sched_barrier(0)
+                    # during the requant. (Fencing them in here: 384 columns spill,
+                    # 0.6% slower on the 384-column rows.)
                     if const_expr(sl + 1 < slices):
                         gate_up_prologue(cs + 1)
                     else:
                         if const_expr(dn):
                             load_down(fx.Int32(0), nb * slices, w_d[0])
-                    rocdl.sched_barrier(0)
                     for b in range_constexpr(n_blk):
                         for gi in range_constexpr(n_groups):
                             m = fx.Float32(0.0)
@@ -1068,7 +1107,10 @@ def launch_fmoe_blockscale(
                             # All four lanes of a token store the same max: no
                             # branch, so the folds above aren't sunk past one.
                             fx.ptr_store(
-                                m, fx.add_offset(lds_f32, amax_w + b * ROWS + gi * 16)
+                                m,
+                                fx.add_offset(
+                                    lds_f32, amax_w + at(amax_l, gi * 16, b, 0)
+                                ),
                             )
                     step_barrier()
                     for gi in range_constexpr(n_groups):
@@ -1080,14 +1122,13 @@ def launch_fmoe_blockscale(
                                     fx.ptr_load(
                                         fx.add_offset(
                                             lds_f32,
-                                            amax_r + (w * n_blk + b) * ROWS + gi * 16,
+                                            amax_r + at(amax_l, gi * 16, b, w),
                                         )
                                     ),
                                 )
-                            q = fx.Float32(FP8_MAX) * Float32(
-                                rocdl.rcp(T.f32, Float32(m).ir_value())
-                            )
-                            a = Float32(m) * fx.Float32(1.0 / FP8_MAX) * rw_b[gi]
+                            with fx.arith.fastmath("afn"):
+                                q = fx.Float32(FP8_MAX) / m
+                            a = m * fx.Float32(1.0 / FP8_MAX) * rw_b[gi]
                             if const_expr(sl < n_park):
                                 # Every lane of the token stores the same value.
                                 fx.ptr_store(
@@ -1096,19 +1137,11 @@ def launch_fmoe_blockscale(
                             else:
                                 act_s[sl][gi][b] = a
                             for j in range_constexpr(2 * b, 2 * b + 2):
-                                v = [
-                                    (h[j][gi][r] * q).ir_value()
-                                    for r in range_constexpr(4)
-                                ]
-                                pk = rocdl.cvt_pk_fp8_f32(
-                                    T.i32, v[0], v[1], fx.Int32(0).ir_value(), 0
-                                )
-                                pk = rocdl.cvt_pk_fp8_f32(T.i32, v[2], v[3], pk, 1)
+                                v = [h[j][gi][r] * q for r in range_constexpr(4)]
+                                pk = pack_fp8(v)
                                 # C lane: token lane16, column 64 (j & 1) + 16 w + 4 kgrp of block b.
-                                off = (
-                                    st_w[j % 2] + (sl * h_panel + stack_off(b, gi)) // 4
-                                )
-                                fx.ptr_store(Int32(pk), fx.add_offset(lds_i32, off))
+                                off = st_w[j % 2] + at(h_l32, gi, b, sl, 0)
+                                fx.ptr_store(pk, fx.add_offset(lds_i32, off))
                 step_barrier()  # ws 2: h of this tile handed to the down waves
 
             if const_expr(dn):
@@ -1128,9 +1161,7 @@ def launch_fmoe_blockscale(
                     if tid == 0:
                         t_dead = now() + ADMIT_WAIT
                         while (sem_load() >= down_limit) & (now() - t_dead < 0):
-                            llvm.inline_asm(
-                                None, [], "s_sleep 2", "", has_side_effects=True
-                            )
+                            rocdl.s_sleep(2)
                         sem_add(1)
                 if const_expr(not pp):
                     gpu.barrier()
@@ -1167,9 +1198,7 @@ def launch_fmoe_blockscale(
                                 v = fx.fma(p, scale, y.pop((t, gi)))
                                 frag = fx.make_rmem_tensor(4, BFloat16)
                                 frag.store(v.to(BFloat16))
-                                idx = relay_w + (
-                                    slot * RELAY // 2 + gi * 16 * RELAY_PITCH + t * 64
-                                )
+                                idx = relay_w + at(relay_l, gi * 16, t * 64, slot)
                                 fx.copy(
                                     write8,
                                     frag,
@@ -1184,14 +1213,12 @@ def launch_fmoe_blockscale(
                             [
                                 sload_f32(
                                     dq_src,
-                                    (
-                                        expert * kd
-                                        + turn * (TURN_N // BLK)
-                                        + t * 64 // BLK
-                                    )
-                                    * ki
-                                    + (nb * slices + sl) * (cols // BLK)
-                                    + kb,
+                                    at(
+                                        dq_l,
+                                        expert,
+                                        turn * (TURN_N // BLK) + t * 64 // BLK,
+                                        (nb * slices + sl) * n_blk + kb,
+                                    ),
                                 )
                                 for kb in range_constexpr(n_blk)
                             ]
@@ -1201,7 +1228,7 @@ def launch_fmoe_blockscale(
                         def read_dn(gi, frags):
                             for kb in range_constexpr(n_blk):
                                 read_b(
-                                    (sl * h_panel + stack_off(kb, gi)) // 4,
+                                    at(h_l32, gi, kb, sl, 0),
                                     frags[kb],
                                     st_lo,
                                     st_hi,
@@ -1306,19 +1333,19 @@ def launch_fmoe_blockscale(
                 compute_tile(eb, nb)
 
     kernel_fmoe(
-        fx.Int64(fx.ptrtoint(arg_o)),
-        fx.Int64(fx.ptrtoint(arg_x)),
-        fx.Int64(fx.ptrtoint(arg_gu)),
-        fx.Int64(fx.ptrtoint(arg_dw)),
-        fx.Int64(fx.ptrtoint(arg_ids)),
-        fx.Int64(fx.ptrtoint(arg_rw)),
-        fx.Int64(fx.ptrtoint(arg_eids)),
-        fx.Int64(fx.ptrtoint(arg_nvalid)),
-        fx.Int64(fx.ptrtoint(arg_xq)),
-        fx.Int64(fx.ptrtoint(arg_gq)),
-        fx.Int64(fx.ptrtoint(arg_dq)),
-        fx.Int64(fx.ptrtoint(arg_sem)),
-        fx.Int64(fx.ptrtoint(arg_p)),
+        arg_o,
+        arg_x,
+        arg_gu,
+        arg_dw,
+        arg_ids,
+        arg_rw,
+        arg_eids,
+        arg_nvalid,
+        arg_xq,
+        arg_gq,
+        arg_dq,
+        arg_sem,
+        arg_p,
         i32_tokens,
         i32_experts,
         value_attrs={"rocdl.waves_per_eu": 2 if pp else 1},
